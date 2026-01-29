@@ -15,6 +15,13 @@
 // D) Cache last STATUSTEXT and re-print it on unexpected disarm for context.
 // E) Fix compile: use mavlink_msg_set_attitude_target_encode (pack signature varies with extensions).
 // F) Fix MAP_W/H as true integer constants (avoid VLA-at-file-scope warning).
+//
+// NEW (drift/flip fix):
+// G) Never command LOCAL_NED translation/position hold until XY is stable.
+//    - Add vel_xy_allowed() + XY_STABLE_HOLD_MS timer.
+//    - In HOVER/EXPLORE/TURNING-pause: if XY not stable -> BODY-frame zero velocity + yaw hold only.
+//    - Delay hover position lock until XY stable for >= 1s.
+//    - Keep LANDING/CEILING vertical commands in LOCAL_NED (world vertical).
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -930,10 +937,55 @@ static bool pose_good_for_mapping(uint64_t t) {
   return true;
 }
 
-// Hover in place
-static void hover_hold_tick(uint64_t t) {
+// ----------------------------- Drift/flip fix gating -------------------
+#if defined(MAV_FRAME_BODY_OFFSET_NED)
+  #define MOVE_FRAME MAV_FRAME_BODY_OFFSET_NED
+#else
+  #define MOVE_FRAME MAV_FRAME_BODY_NED
+#endif
+
+static const uint64_t XY_STABLE_HOLD_MS = 1000;     // must be "good" for this long before we allow pos hold / exploration translation
+static uint64_t xy_ok_since_ms = 0;
+
+static bool vel_xy_allowed(uint64_t t) {
+  // We only allow world-frame position/translation control when estimator says XY control is OK.
+  if (!xy_ctrl_ok(t)) return false;
+  if (!have_att) return false;
+
+  bool lpos_fresh = have_lpos && (t - lpos_last_update_ms) < 400;
+  if (!lpos_fresh) return false;
+
+  // If optical flow is present, require decent quality (prevents sideways lunge from garbage flow)
+  if (of_fresh(t) && of_quality < 50) return false;
+
+  // Avoid allowing XY right at ground / takeoff dust-up
+  if (!isnan(alt_est_m) && alt_est_m < 0.12f) return false;
+
+  return true;
+}
+
+static bool vel_xy_stable(uint64_t t) {
+  bool ok = vel_xy_allowed(t);
+  if (ok) {
+    if (xy_ok_since_ms == 0) xy_ok_since_ms = t;
+    if ((t - xy_ok_since_ms) >= XY_STABLE_HOLD_MS) return true;
+    return false;
+  } else {
+    xy_ok_since_ms = 0;
+    return false;
+  }
+}
+
+// Hover in place (but only lock position once XY is stable)
+static void hover_hold_tick(uint64_t t, bool allow_pos_hold) {
   bool lpos_fresh = have_lpos && (t - lpos_last_update_ms) < 400;
   bool yaw_ok = have_att;
+
+  if (!allow_pos_hold) {
+    // Do NOT lock position. Just command zero body-frame velocity + yaw hold.
+    send_vel_frame(0,0,0, yaw_hold_rate(), MOVE_FRAME);
+    return;
+  }
 
   if (!hover_hold_valid && lpos_fresh && yaw_ok && !isnan(alt_est_m)) {
     hover_hold_x_m = lpos_x_m;
@@ -947,7 +999,7 @@ static void hover_hold_tick(uint64_t t) {
   if (hover_hold_valid && lpos_fresh && yaw_ok) {
     send_pos_yaw_ned(hover_hold_x_m, hover_hold_y_m, hover_hold_z_ned_m, hover_hold_yaw_deg);
   } else {
-    send_vel_frame(0,0,0,0, MAV_FRAME_LOCAL_NED);
+    send_vel_frame(0,0,0, yaw_hold_rate(), MOVE_FRAME);
   }
 }
 
@@ -1614,6 +1666,7 @@ static void enter_state(State ns) {
 
   if (ns == ST_HOVER) {
     hover_enter_ms = now_ms();
+    hover_hold_valid = false; // force re-capture only after XY is stable
   }
 
   if (ns == ST_LANDING) {
@@ -1813,7 +1866,6 @@ static void control_tick(void) {
   battery_failsafe_tick(t);
 
 #if PRINT_LANDED_STATE_EACH_TICK
-  // Required: print EXTENDED_SYS_STATE.landed_state every loop
   if (have_ext) {
     printf("EXT_SYS_STATE.landed_state=%u(%s)\n", (unsigned)landed_state, landed_state_name(landed_state));
   } else {
@@ -1824,6 +1876,8 @@ static void control_tick(void) {
   static uint64_t t_last_print = 0;
   if (t - t_last_print >= (1000 / PRINT_HZ)) {
     t_last_print = t;
+
+    bool xy_stable = vel_xy_stable(t);
 
     printf("st=%s want=%d HB=%d mode=%u armed=%d alt=",
            state_name(st), want_arm?1:0, (last_hb_ms?1:0),
@@ -1848,6 +1902,8 @@ static void control_tick(void) {
              sys_health_bit(MAV_SYS_STATUS_SENSOR_3D_GYRO, t)?1:0,
              sys_health_bit(MAV_SYS_STATUS_SENSOR_MOTOR_OUTPUTS, t)?1:0);
     }
+
+    printf(" xyOK=%d", xy_stable ? 1 : 0);
 
     printf(" lpos=");
     bool lpos_fresh2 = have_lpos && (t - lpos_last_update_ms) < 400;
@@ -1949,6 +2005,7 @@ static void control_tick(void) {
     }
   }
 
+  // Ceiling safety: keep WORLD vertical (LOCAL_NED) so this doesn't add sideways component when tilted.
   if (ceiling_active && fc_armed) {
     send_vel_frame(0,0, +0.30f, 0, MAV_FRAME_LOCAL_NED);
     return;
@@ -1999,7 +2056,7 @@ static void control_tick(void) {
         guided_takeoff(TAKEOFF_TARGET_M);
         takeoff_sent = true;
         takeoff_sent_ms = t;
-        takeoff_no_vel_until_ms = t + TAKEOFF_NO_VEL_MS; // required holdoff window
+        takeoff_no_vel_until_ms = t + TAKEOFF_NO_VEL_MS;
       } else {
         if (!takeoff_started && (t - takeoff_sent_ms) > 3000) {
           guided_takeoff(TAKEOFF_TARGET_M);
@@ -2035,7 +2092,6 @@ static void control_tick(void) {
             ref != 0 &&
             (t - ref) >= TAKEOFF_START_CHECK_MS) {
 
-          // Only trigger if motors still not ramping (when servo data exists)
           if (servo_fresh && mot_avg <= TAKEOFF_MOT_START_US) {
             takeoff_not_started_printed = true;
             printf("takeoff not started (NAV_TAKEOFF accepted, mot_avg=%.1f). Entering conservative thrust ramp...\n", mot_avg);
@@ -2046,9 +2102,7 @@ static void control_tick(void) {
         }
       }
 
-      // If ramp active: do NOT send SET_POSITION_TARGET_LOCAL_NED; only attitude+thrust.
       if (takeoff_thr_ramp_active) {
-        // keep yaw stable
         if (!have_yaw_target && have_att) {
           have_yaw_target = true;
           yaw_target_deg = current_heading_deg();
@@ -2056,7 +2110,6 @@ static void control_tick(void) {
 
         takeoff_thrust_ramp_tick(t);
 
-        // Exit ramp once off-ground or motors clearly ramped
         if (takeoff_off_ground(t) || (servo_fresh && mot_avg > TAKEOFF_MOT_START_US)) {
           printf("TAKEOFF_RAMP: exit (rf=%.2f, landed=%u(%s), mot_avg=%.1f). Re-issuing GUIDED TAKEOFF.\n",
                  (have_rangefinder ? rangefinder_m : NAN),
@@ -2067,7 +2120,6 @@ static void control_tick(void) {
           takeoff_started = true;
           takeoff_started_ms = t;
 
-          // Re-issue takeoff to let ArduPilot own the climb.
           guided_takeoff(TAKEOFF_TARGET_M);
           takeoff_no_vel_until_ms = t + TAKEOFF_NO_VEL_MS;
         } else if ((t - takeoff_thr_ramp_start_ms) > TO_RAMP_ABORT_MS) {
@@ -2076,24 +2128,15 @@ static void control_tick(void) {
           enter_state(ST_LIFTOFF_ASSIST);
         }
 
-        // While ramping, don't proceed further in TAKEOFF logic this tick.
         break;
       }
 
-      // REQUIRED: after NAV_TAKEOFF, do not send any velocity SET_POSITION_TARGET_LOCAL_NED for ~2 seconds,
-      // or until takeoff clearly starts. (We send NONE in TAKEOFF; this is extra guard in case you add later.)
-      if (!takeoff_started && takeoff_no_vel_until_ms != 0 && t < takeoff_no_vel_until_ms) {
-        // do nothing: let ArduPilot do spool-up from NAV_TAKEOFF
-      }
-
-      // If Z controller unhealthy and we are stalled -> assist
       if (!z_ctrl_ok(t) && !takeoff_started && !isnan(alt_est_m) && alt_est_m < 0.10f && (t - takeoff_sent_ms) > 1200) {
         printf("Z ALT CTRL unhealthy + takeoff stalled -> LIFTOFF_ASSIST\n");
         enter_state(ST_LIFTOFF_ASSIST);
         break;
       }
 
-      // Stall detection: if still not started after a while -> assist
       if (!takeoff_started && (t - takeoff_sent_ms) > 4500) {
         printf("TAKEOFF stalled (alt=%.2f, mot_avg=%.1f) -> LIFTOFF_ASSIST\n",
                alt_est_m, (have_servo ? servo_motor_avg() : -1.0f));
@@ -2101,35 +2144,12 @@ static void control_tick(void) {
         break;
       }
 
-      // Transition to hover when at target
+      // Transition to hover when at target (BUT we will not lock position until XY stable)
       if (!isnan(alt_est_m) && alt_est_m >= (TAKEOFF_TARGET_M - 0.05f)) {
         have_yaw_target = have_att;
         yaw_target_deg = current_heading_deg();
-
-        hover_hold_valid = false;
-        bool lpos_fresh = have_lpos && (t - lpos_last_update_ms) < 400;
-        if (lpos_fresh && have_att && !isnan(alt_est_m)) {
-          hover_hold_x_m = lpos_x_m;
-          hover_hold_y_m = lpos_y_m;
-          hover_hold_z_ned_m = -alt_est_m;
-          hover_hold_yaw_deg = yaw_target_deg;
-          hover_hold_set_ms = t;
-          hover_hold_valid = true;
-
-          if (!map_inited) {
-            map_origin_x = hover_hold_x_m;
-            map_origin_y = hover_hold_y_m;
-            memset(occ_grid, 0, sizeof(occ_grid));
-            map_inited = true;
-            printf("Map init: origin (x=%.2f, y=%.2f), grid %dx%d @ %.2fm\n",
-                   map_origin_x, map_origin_y, MAP_W, MAP_H, MAP_RES_M);
-          }
-        }
-
         enter_state(ST_HOVER);
       }
-
-      // NOTE: No send_vel_frame() nudges here anymore. NAV_TAKEOFF owns the climb.
     } break;
 
     case ST_LIFTOFF_ASSIST:
@@ -2142,18 +2162,39 @@ static void control_tick(void) {
         yaw_target_deg = current_heading_deg();
       }
 
-      hover_hold_tick(t);
+      bool xy_stable = vel_xy_stable(t);
+
+      // Delay: don't lock hover position until XY has been stable for >=1s.
+      hover_hold_tick(t, xy_stable);
+
+      // Initialize map only when XY becomes stable and we have a valid hover lock snapshot
+      if (!map_inited && xy_stable && hover_hold_valid) {
+        map_origin_x = hover_hold_x_m;
+        map_origin_y = hover_hold_y_m;
+        memset(occ_grid, 0, sizeof(occ_grid));
+        map_inited = true;
+        printf("Map init: origin (x=%.2f, y=%.2f), grid %dx%d @ %.2fm\n",
+               map_origin_x, map_origin_y, MAP_W, MAP_H, MAP_RES_M);
+      }
 
       if (HOVER_TEST_ONLY) break;
 
-      if ((t - hover_enter_ms) > 1200) {
+      // Only proceed to explore if XY is stable (prevents drift-flip immediately after takeoff).
+      if (xy_stable && (t - hover_enter_ms) > 1200) {
         enter_state(ST_EXPLORE);
       }
     } break;
 
     case ST_EXPLORE: {
+      // If we aren't stable, DO NOT translate. Hold still in BODY frame.
+      bool xy_stable = vel_xy_stable(t);
+      if (!xy_stable) {
+        send_vel_frame(0,0,0, yaw_hold_rate(), MOVE_FRAME);
+        break;
+      }
+
       if (t < explore_pause_until_ms) {
-        send_vel_frame(0,0,0, yaw_hold_rate(), MAV_FRAME_LOCAL_NED);
+        send_vel_frame(0,0,0, yaw_hold_rate(), MOVE_FRAME);
         break;
       }
 
@@ -2195,14 +2236,12 @@ static void control_tick(void) {
         }
       }
 
-#ifdef MAV_FRAME_BODY_OFFSET_NED
-      send_vel_frame(+FWD_VEL, 0.0f, 0.0f, yaw_hold_rate(), MAV_FRAME_BODY_OFFSET_NED);
-#else
-      send_vel_frame(+FWD_VEL, 0.0f, 0.0f, yaw_hold_rate(), MAV_FRAME_BODY_NED);
-#endif
+      // Forward creep relative to the DRONE (BODY frame), with yaw hold.
+      send_vel_frame(+FWD_VEL, 0.0f, 0.0f, yaw_hold_rate(), MOVE_FRAME);
     } break;
 
     case ST_TURNING: {
+      // If XY isn't stable, we still allow yaw-only turning (body frame), but no translation.
       if (!turning_init) {
         if (turning_dir_forced) {
           turning_dir = forced_turn_dir;
@@ -2229,7 +2268,8 @@ static void control_tick(void) {
       if (yr > YAW_RATE_DPS) yr = YAW_RATE_DPS;
       if (yr < -YAW_RATE_DPS) yr = -YAW_RATE_DPS;
 
-      send_vel_frame(0,0,0, yr, MAV_FRAME_LOCAL_NED);
+      // Yaw-only command in BODY frame (avoids relying on world-frame while estimator is shaky)
+      send_vel_frame(0,0,0, yr, MOVE_FRAME);
 
       if (fabsf(err) < 6.0f || (t - turn_start_ms) > 6000) {
         have_yaw_target = true;
@@ -2251,6 +2291,7 @@ static void control_tick(void) {
         }
       }
 
+      // Keep WORLD vertical descent (LOCAL_NED) to avoid lateral component when tilted.
       send_vel_frame(0,0,+0.15f, 0, MAV_FRAME_LOCAL_NED);
 
       bool near_ground = (!isnan(alt_est_m) && alt_est_m < 0.10f);
