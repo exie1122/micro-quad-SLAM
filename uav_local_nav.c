@@ -744,7 +744,7 @@ static void disarm_fc(void) {
   if (!have_fc) return;
 
   uint64_t t = now_ms();
-  if (t - last_disarm_cmd_ms < 50) return;
+  if (t - last_disarm_cmd_ms < 10) return;
   last_disarm_cmd_ms = t;
 
   printf("Requesting DISARM...\n");
@@ -2317,17 +2317,9 @@ static void control_tick(void) {
     } break;
 
     case ST_DISARMING: {
-      bool near_ground = (!isnan(alt_est_m) && alt_est_m < 0.10f);
-      bool on_ground = (have_ext && landed_state == MAV_LANDED_STATE_ON_GROUND);
-
       if (fc_armed) {
-        disarm_fc();
-
-        if (disarm_start_ms == 0) disarm_start_ms = t;
-
-        if ((t - disarm_start_ms) > 2000 && (near_ground || on_ground)) {
-          disarm_fc_force();
-        }
+        // Immediate force disarm regardless of altitude or state
+        disarm_fc_force();
       } else {
         disarm_start_ms = 0;
         enter_state(ST_IDLE);
