@@ -18,3 +18,21 @@ Frame: 2" Carbon Fiber
 
 
 
+
+January 30, 2026 Changes   
+ATC_RAT_RLL_P = 0.07   
+ATC_RAT_PIT_P = 0.07   
+
+ATC_RAT_RLL_I = 0.06   
+ATC_RAT_PIT_I = 0.06   
+
+ATC_RAT_RLL_D = 0.0045   
+ATC_RAT_PIT_D = 0.0045   
+
+
+YAW   
+ATC_RAT_YAW_P = 0.05   
+ATC_RAT_YAW_I = 0.015   
+ATC_RAT_YAW_D = 0.0    
+
+
