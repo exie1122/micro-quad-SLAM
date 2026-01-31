@@ -23,6 +23,15 @@
 //    - Delay hover position lock until XY stable for >= 1s.
 //    - Keep LANDING/CEILING vertical commands in LOCAL_NED (world vertical).
 
+
+
+
+//IMPORTANT VARIABLES:
+
+//PRINT_HZ is a macro that controls how often status is printed to console
+//HOVER_TEST_ONLY when true makes the UAV only hover in place after takeoff for testing purposes
+//PRINT_LANDED_STATE_EACH_TICK when set to 1 makes the code print the landed state every tick for debugging
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -563,7 +572,7 @@ static bool     assist_warned_override = false;
 static uint64_t disarm_start_ms = 0;
 
 // ----------------------------- Timing helpers --------------------------
-#define PRINT_HZ 5
+#define PRINT_HZ 2
 static uint64_t now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -735,7 +744,7 @@ static void disarm_fc(void) {
   if (!have_fc) return;
 
   uint64_t t = now_ms();
-  if (t - last_disarm_cmd_ms < 800) return;
+  if (t - last_disarm_cmd_ms < 50) return;
   last_disarm_cmd_ms = t;
 
   printf("Requesting DISARM...\n");
@@ -1996,14 +2005,21 @@ static void control_tick(void) {
   }
   fc_armed_prev = fc_armed;
 
+
   if (!want_arm && fc_armed) {
-    bool near_ground = (!isnan(alt_est_m) && alt_est_m < 0.10f);
-    if (near_ground || (have_ext && landed_state == MAV_LANDED_STATE_ON_GROUND)) {
-      enter_state(ST_DISARMING);
-    } else {
-      enter_state(ST_LANDING);
-    }
+  enter_state(ST_DISARMING);
   }
+
+  //ONLY USE THIS PART WHEN HOVER IS STABLE
+
+  // if (!want_arm && fc_armed) {
+  //   bool near_ground = (!isnan(alt_est_m) && alt_est_m < 0.10f);
+  //   if (near_ground || (have_ext && landed_state == MAV_LANDED_STATE_ON_GROUND)) {
+  //     enter_state(ST_DISARMING);
+  //   } else {
+  //     enter_state(ST_LANDING);
+  //   }
+  // }
 
   // Ceiling safety: keep WORLD vertical (LOCAL_NED) so this doesn't add sideways component when tilted.
   if (ceiling_active && fc_armed) {
