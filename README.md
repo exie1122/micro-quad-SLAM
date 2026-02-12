@@ -42,4 +42,9 @@ ATC_RAT_YAW_I = 0.015
 ATC_RAT_YAW_D = 0.0    
 
 
+# Notes
+Quadcopter was the most stable in hover mode with the Jan 28th code/commit.
+
+
+
 
