@@ -31,7 +31,7 @@ Frame: 2.5" Carbon Fiber
 Propellers: 2.5" Bi-blade
 
 
-January 30, 2026 Changes   
+# January 30, 2026 Changes   
 ATC_RAT_RLL_P = 0.07   
 ATC_RAT_PIT_P = 0.07   
 
@@ -50,6 +50,7 @@ ATC_RAT_YAW_D = 0.0
 
 # Notes
 Quadcopter was the most stable in hover mode with the Jan 28th code/commit.
+
 
 
 
