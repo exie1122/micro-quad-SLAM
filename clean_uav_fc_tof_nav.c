@@ -2,17 +2,19 @@
 //
 // STABILITY/DEMO REVISION:
 // - Hover-only behavior (exploration removed for minimal hover testing)
-// - Faster XY lock: capture first fresh LOCAL_POSITION_NED once airborne > HOVER_CAPTURE_MIN_ALT_M
-// - Always hold Z using a Z-only LOCAL_NED setpoint (ignore X/Y) even while XY is not yet locked
+// - XY lock now requires a continuous low-vx/low-vy dwell before freezing the hover anchor
+// - Always hold Z using a Z-only LOCAL_NED setpoint until XY has been explicitly locked
 // - Ceiling uses MAX of available altitude sources (RF and LPOS) so a “stuck-low” RF can’t hide a real climb
 // - DISARM: force-disarm immediately when want_arm drops (param2=21196), any state/mode
 // - Line-buffered stdout / unbuffered stderr for reliable logging
 // - Disable per-tick EXT_SYS_STATE spam by default (printing at 50Hz can wreck timing)
+// - The ToF ring is filtered and logged, but is not part of the hover stabilization control loop
 //
 // IMPORTANT NOTE:
 // Companion code can *request* poshold/althold, but if your FC estimator/OF/rangefinder is bad,
 // the FC will drift anyway. This script makes the companion-side behavior as strict as possible
 // (continuous setpoint streaming + gating), and failsafes to LAND if pose/alt is unhealthy.
+//CURRENT PROBLEM: DRONE ARMS, ACCELERATES ON THE Z AXIS, THEN CRASHES INTO THE CEILING. HOWEVER, AFTER SWITCHING TO 2.5" PROPELLORS, THE STABILITY ISSUE IS FIXED. 
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,6 +109,13 @@ static const float HOVER_CAPTURE_MIN_ALT_M = 0.15f;  // don't lock XY until clea
 static const uint64_t PREARM_STABLE_MS = 400;       // require sensors/control stable before arming
 static const bool REQUIRE_RANGEFINDER_FOR_HOVER = true;
 static const bool REQUIRE_OPTICAL_FLOW_FOR_HOVER = true;
+static const uint64_t SENSOR_FRESH_MS = 400;
+static const uint64_t BOOTSTRAP_GRACE_MS = 2000;
+static const uint64_t BOOTSTRAP_FAILSAFE_MS = 1800;
+static const uint64_t FULL_HOVER_FAILSAFE_MS = 900;
+static const uint64_t XY_LOCK_DWELL_MS = 1000;
+static const float VX_LOCK_MAX_MPS = 0.08f;
+static const float VY_LOCK_MAX_MPS = 0.08f;
 
 // ToF constraints
 static const float TOF_MAX_RANGE_M = 4.00f;
@@ -129,7 +138,7 @@ static const float    ASSIST_MOTOR_DELTA_MIN = 15.0f; // lower delta threshold
 // ---------------------- TAKEOFF gating + thrust ramp -------------------
 #define PRINT_LANDED_STATE_EACH_TICK 0  // set to 1 only for short debugging; hurts timing at 50Hz
 
-static const uint64_t TAKEOFF_NO_VEL_MS        = 900;     // pause streaming setpoints right after NAV_TAKEOFF
+static const uint64_t TAKEOFF_NO_VEL_MS        = 400;     // shorter pause before we start streaming setpoints
 static const uint64_t TAKEOFF_RAMP_DELAY_MS    = 700;     // start ramp a bit sooner
 static const float    TAKEOFF_MOT_START_US      = 1150.0f;
 static const uint64_t TAKEOFF_TIMEOUT_MS        = 8000;
@@ -137,6 +146,7 @@ static const uint64_t TAKEOFF_TIMEOUT_MS        = 8000;
 static bool     takeoff_started                 = false;
 static uint64_t takeoff_started_ms              = 0;
 static float    takeoff_alt0_m                  = NAN;    // altitude snapshot when NAV_TAKEOFF sent
+static bool     takeoff_att_ramp_was_active     = false;
 
 FILE *csv_fp = NULL;
 // Data storage
@@ -351,21 +361,49 @@ static const char* state_name(State s) {
 static State st = ST_WAIT_LINK;
 static bool want_arm = false;
 
+typedef enum {
+  HPH_GROUND = 0,
+  HPH_ARM_SPOOL,
+  HPH_TAKEOFF_Z_ONLY,
+  HPH_PRELOCK_HOVER,
+  HPH_XY_LOCK,
+  HPH_FULL_HOVER,
+  HPH_LANDING
+} HoverPhase;
+
+static const char* hover_phase_name(HoverPhase p) {
+  switch (p) {
+    case HPH_GROUND: return "GROUND";
+    case HPH_ARM_SPOOL: return "ARM_SPOOL";
+    case HPH_TAKEOFF_Z_ONLY: return "TAKEOFF_Z_ONLY";
+    case HPH_PRELOCK_HOVER: return "PRELOCK_HOVER";
+    case HPH_XY_LOCK: return "XY_LOCK";
+    case HPH_FULL_HOVER: return "FULL_HOVER";
+    case HPH_LANDING: return "LANDING";
+    default: return "?";
+  }
+}
+
 // Yaw target lock
 static bool  have_yaw_target = false;
 static float yaw_target_deg = 0.0f;
 
 // We separate “Z/YAW hold is active” from “XY lock is valid”.
 // - We always clamp Z (Z-only setpoint) once we start controlling.
-// - We lock XY as soon as LOCAL_POSITION_NED is fresh and airborne above HOVER_CAPTURE_MIN_ALT_M.
+// - We lock XY only after fresh LPOS velocity remains below the lock thresholds for the full dwell.
 static float hover_hold_yaw_deg = NAN;
 static bool  hover_xy_locked = false;      // true only after XY lock achieved
-static bool  hover_xy_prelock_valid = false;
-static float hover_prelock_x_m = 0.0f;
-static float hover_prelock_y_m = 0.0f;
 static uint64_t hover_xy_lock_ms = 0;
 static float hover_lock_x_m = 0.0f;
 static float hover_lock_y_m = 0.0f;
+static bool     xy_lock_candidate_active = false;
+static uint64_t xy_lock_candidate_since_ms = 0;
+static HoverPhase hover_phase = HPH_GROUND;
+static uint64_t bootstrap_grace_until_ms = 0;
+static bool     bootstrap_grace_was_active = false;
+static uint64_t hover_health_fail_since_ms = 0;
+static uint64_t hover_ready_fail_log_ms = 0;
+static char     hover_ready_fail_last_reason[160] = {0};
 
 // Ceiling logic
 static bool ceiling_active = false;
@@ -408,12 +446,6 @@ static uint64_t takeoff_att_ramp_start_ms = 0;
 
 // Disarm timer
 static uint64_t disarm_start_ms = 0;
-
-// Stale-sensor hysteresis
-static uint32_t lpos_stale_count = 0;
-static uint32_t rf_stale_count   = 0;
-static uint32_t alt_stale_count  = 0;
-static const uint32_t STALE_FAIL_TICKS = 40; // ~1–2s depending on loop rate
 
 // ----------------------------- Timing helpers --------------------------
 #define PRINT_HZ 1
@@ -473,6 +505,113 @@ static void log_msg(const char* fmt, ...) {
 
 // Redirect all normal printf calls to log_msg
 #define printf log_msg
+
+static void append_reason(char* buf, size_t buf_sz, const char* token) {
+  if (!buf || buf_sz == 0 || !token || !token[0]) return;
+
+  size_t len = strlen(buf);
+  if (len >= buf_sz - 1) return;
+
+  if (len > 0) {
+    snprintf(buf + len, buf_sz - len, ",%s", token);
+  } else {
+    snprintf(buf, buf_sz, "%s", token);
+  }
+}
+
+static bool lpos_fresh(uint64_t t) {
+  return have_lpos && (t - lpos_last_update_ms) < SENSOR_FRESH_MS;
+}
+
+static bool rf_fresh(uint64_t t) {
+  return have_rangefinder && (t - rangefinder_last_update_ms) < SENSOR_FRESH_MS;
+}
+
+static bool bootstrap_grace_active(uint64_t t) {
+  return bootstrap_grace_until_ms != 0 && t < bootstrap_grace_until_ms;
+}
+
+static HoverPhase current_hover_phase(void) {
+  if (!fc_armed) return HPH_GROUND;
+
+  if (st == ST_ARMING) return HPH_ARM_SPOOL;
+  if (st == ST_TAKEOFF || st == ST_LIFTOFF_ASSIST) return HPH_TAKEOFF_Z_ONLY;
+  if (st == ST_HOVER && hover_xy_locked) return HPH_FULL_HOVER;
+  if (st == ST_HOVER && xy_lock_candidate_active) return HPH_XY_LOCK;
+  if (st == ST_HOVER) return HPH_PRELOCK_HOVER;
+  if (st == ST_LANDING) return HPH_LANDING;
+  return HPH_GROUND;
+}
+
+static bool phase_uses_z_only(HoverPhase phase) {
+  return phase == HPH_TAKEOFF_Z_ONLY || phase == HPH_PRELOCK_HOVER || phase == HPH_XY_LOCK;
+}
+
+static float hover_target_alt_m_for_phase(HoverPhase phase) {
+  float target_m = (phase == HPH_FULL_HOVER) ? HOVER_TARGET_M : TAKEOFF_TARGET_M;
+  float max_up = CEIL_M - CEIL_MARGIN_M;
+  if (max_up < 0.10f) max_up = 0.10f;
+  if (target_m > max_up) target_m = max_up;
+  return target_m;
+}
+
+static float hover_target_z_down_for_phase(HoverPhase phase) {
+  return -hover_target_alt_m_for_phase(phase);
+}
+
+static float hover_target_z_down(void) {
+  return hover_target_z_down_for_phase(current_hover_phase());
+}
+
+static void log_bootstrap_event(uint64_t t, const char* event, const char* reason) {
+  HoverPhase phase = current_hover_phase();
+  bool lpos_ok = lpos_fresh(t);
+  bool rf_ok = rf_fresh(t);
+  bool of_ok = have_of && (t - of_last_update_ms) < SENSOR_FRESH_MS;
+  float vx = have_xy ? lpos_vx_mps : NAN;
+  float vy = have_xy ? lpos_vy_mps : NAN;
+
+  printf("EVENT: %s phase=%s reason=%s vx=%.2f vy=%.2f flow_q=%u rf_fresh=%d lpos_fresh=%d z_tgt=%.2f grace=%d\n",
+         event ? event : "UNKNOWN",
+         hover_phase_name(phase),
+         (reason && reason[0]) ? reason : "-",
+         vx, vy,
+         of_ok ? (unsigned)of_quality : 0u,
+         rf_ok ? 1 : 0,
+         lpos_ok ? 1 : 0,
+         hover_target_z_down_for_phase(phase),
+         bootstrap_grace_active(t) ? 1 : 0);
+}
+
+static void sync_hover_phase(uint64_t t) {
+  HoverPhase phase = current_hover_phase();
+  if (phase == hover_phase) return;
+
+  hover_phase = phase;
+  log_bootstrap_event(t, "PHASE", hover_phase_name(phase));
+  if (phase_uses_z_only(phase)) {
+    log_bootstrap_event(t, "Z_ONLY_ACTIVE", "bootstrap_z_only");
+  }
+}
+
+static void start_bootstrap_grace(uint64_t t, const char* reason) {
+  uint64_t new_until = t + BOOTSTRAP_GRACE_MS;
+  bool was_active = bootstrap_grace_active(t);
+  if (new_until > bootstrap_grace_until_ms) bootstrap_grace_until_ms = new_until;
+
+  if (!was_active) {
+    bootstrap_grace_was_active = true;
+    log_bootstrap_event(t, "GRACE_START", reason);
+  }
+}
+
+static void poll_bootstrap_grace(uint64_t t) {
+  bool active = bootstrap_grace_active(t);
+  if (!active && bootstrap_grace_was_active) {
+    bootstrap_grace_was_active = false;
+    log_bootstrap_event(t, "GRACE_END", "bootstrap_window_elapsed");
+  }
+}
 
 // ----------------------------- UART open -------------------------------
 static int open_uart(const char* dev, int baud) {
@@ -752,7 +891,7 @@ static void send_z_yaw_ned(float z_down, float yaw_deg) {
   if (t - last_log > 2000) {
     last_log = t;
     char buf[64];
-    snprintf(buf, sizeof(buf), "CMD_Z_YAW z=%.2f yaw=%.1f", z_down, yaw_deg);
+    snprintf(buf, sizeof(buf), "CMD_Z z=%.2f yaw=%.1f", z_down, yaw_deg);
     if(log_fp) { fprintf(log_fp, "# %s\n", buf); }
     if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
   }
@@ -793,7 +932,7 @@ static void send_attitude_target_thrust(float thrust, float yaw_deg) {
   }
 
   if (thrust < 0.0f) thrust = 0.0f;
-  if (thrust > 0.90f) thrust = 0.90f;
+  if (thrust > 0.95f) thrust = 0.95f;
 
   mavlink_set_attitude_target_t at;
   memset(&at, 0, sizeof(at));
@@ -933,7 +1072,7 @@ static bool xy_ctrl_ok(uint64_t t) {
 }
 
 static bool of_fresh(uint64_t t) {
-  return have_of && (t - of_last_update_ms) < 400;
+  return have_of && (t - of_last_update_ms) < SENSOR_FRESH_MS;
 }
 
 static bool batt_vpc_valid(float vpc) {
@@ -965,93 +1104,126 @@ static bool batt_vpc_sample(uint64_t t, float* out_vpc) {
 }
 
 // ----------------------------- Drift/flip fix gating -------------------
-static const uint64_t XY_STABLE_HOLD_MS = 1000;
-static uint64_t xy_ok_since_ms = 0;
 static uint64_t prearm_ok_since_ms = 0;
 
-static bool vel_xy_allowed(uint64_t t) {
-  if (!xy_ctrl_ok(t)) return false;
-  if (!have_att) return false;
+static bool z_bootstrap_ready_now(uint64_t t, char* reasons, size_t reasons_sz) {
+  if (reasons && reasons_sz > 0) reasons[0] = '\0';
 
-  bool lpos_fresh = have_lpos && (t - lpos_last_update_ms) < 400;
-  if (!lpos_fresh) return false;
+  bool att_ok = have_att;
+  bool z_ok = z_ctrl_ok(t);
+  bool rf_ok = rf_fresh(t) && !isnan(rangefinder_m);
+  bool lpos_ok = lpos_fresh(t) && !isnan(lpos_alt_m);
+  bool alt_ok = rf_ok || lpos_ok;
 
-  // Permit lower OF quality before lock; rely on velocity stability instead of high Q.
-  if (of_fresh(t) && of_quality < 30) return false;
+  if (!att_ok) append_reason(reasons, reasons_sz, "no_att");
+  if (!z_ok) append_reason(reasons, reasons_sz, "z_ctrl_unhealthy");
+  if (!alt_ok) append_reason(reasons, reasons_sz, "no_fresh_vertical_data");
 
-  if (!isnan(alt_max_m) && alt_max_m < 0.12f) return false;
-
-  return true;
+  return reasons == NULL || reasons[0] == '\0';
 }
 
-static bool vel_xy_stable(uint64_t t) {
-  bool ok = vel_xy_allowed(t);
-  if (ok) {
-    if (xy_ok_since_ms == 0) xy_ok_since_ms = t;
-    return (t - xy_ok_since_ms) >= XY_STABLE_HOLD_MS;
-  } else {
-    xy_ok_since_ms = 0;
+static void log_hover_ready_failure(uint64_t t, const char* reason) {
+  bool changed = strncmp(hover_ready_fail_last_reason, reason ? reason : "", sizeof(hover_ready_fail_last_reason)) != 0;
+  if (!changed && (t - hover_ready_fail_log_ms) < 1000) return;
+
+  hover_ready_fail_log_ms = t;
+  snprintf(hover_ready_fail_last_reason, sizeof(hover_ready_fail_last_reason), "%s", reason ? reason : "");
+  log_bootstrap_event(t, "HOVER_READY_FAIL", reason);
+}
+
+static bool hover_ready_now_internal(uint64_t t, bool strict, bool log_fail, char* reasons, size_t reasons_sz) {
+  if (reasons && reasons_sz > 0) reasons[0] = '\0';
+
+  if (!z_bootstrap_ready_now(t, reasons, reasons_sz)) {
+    if (log_fail) log_hover_ready_failure(t, reasons);
     return false;
   }
+
+  if (!strict) return true;
+
+  bool lpos_ok = lpos_fresh(t);
+  bool xy_ok = xy_ctrl_ok(t);
+  bool rf_ok = rf_fresh(t) && !isnan(rangefinder_m);
+  bool alt_ok = !isnan(alt_max_m);
+  bool of_ok = of_fresh(t) && of_quality >= 30;
+
+  if (!lpos_ok) append_reason(reasons, reasons_sz, "lpos_stale");
+  if (!xy_ok) append_reason(reasons, reasons_sz, "xy_ctrl_unhealthy");
+  if (REQUIRE_RANGEFINDER_FOR_HOVER && !rf_ok) append_reason(reasons, reasons_sz, "rangefinder_stale");
+  if (!REQUIRE_RANGEFINDER_FOR_HOVER && !alt_ok) append_reason(reasons, reasons_sz, "alt_unknown");
+  if (REQUIRE_OPTICAL_FLOW_FOR_HOVER && !of_ok) append_reason(reasons, reasons_sz, "flow_unhealthy");
+  if (!alt_ok) append_reason(reasons, reasons_sz, "alt_stale");
+
+  bool ok = reasons == NULL || reasons[0] == '\0';
+  if (!ok && log_fail) log_hover_ready_failure(t, reasons);
+  return ok;
 }
 
-// ----------------------------- Hover / PosHold -------------------------
 static bool hover_ready_now(uint64_t t) {
-  bool lpos_fresh  = have_lpos && (t - lpos_last_update_ms) < 400;
-  bool rf_fresh    = have_rangefinder && (t - rangefinder_last_update_ms) < 400;
-  bool rf_ok       = rf_fresh && !isnan(rangefinder_m);
-  bool of_ok       = of_fresh(t) && of_quality >= 30;
-
-  if (!have_att) return false;
-  if (!lpos_fresh) return false;
-
-  if (!xy_ctrl_ok(t) || !z_ctrl_ok(t)) return false;
-
-  if (REQUIRE_RANGEFINDER_FOR_HOVER) {
-    if (!rf_ok) return false;
-  } else {
-    if (isnan(alt_est_m)) return false;
-  }
-
-  if (REQUIRE_OPTICAL_FLOW_FOR_HOVER) {
-    if (!of_ok) {
-      // Before arming, allow arming even if flow not yet healthy; hover loop will still enforce later.
-      if (fc_armed) return false;
-    }
-  }
-
-  if (isnan(alt_max_m)) return false;
-  return true;
+  char reasons[160];
+  return hover_ready_now_internal(t, true, true, reasons, sizeof(reasons));
 }
 
-static bool hover_ready_stable(uint64_t t) {
-  bool ok = hover_ready_now(t);
+static bool bootstrap_ready_stable(uint64_t t) {
+  char reasons[160];
+  bool ok = hover_ready_now_internal(t, false, false, reasons, sizeof(reasons));
   if (ok) {
     if (prearm_ok_since_ms == 0) prearm_ok_since_ms = t;
     return (t - prearm_ok_since_ms) >= PREARM_STABLE_MS;
-  } else {
-    prearm_ok_since_ms = 0;
-    return false;
   }
+
+  prearm_ok_since_ms = 0;
+  return false;
 }
 
-static float hover_target_z_down(void) {
-  float z_up = HOVER_TARGET_M;
-  float max_up = CEIL_M - CEIL_MARGIN_M;
-  if (max_up < 0.10f) max_up = 0.10f;
-  if (z_up > max_up) z_up = max_up;
-  return -z_up;
+static bool vel_xy_motion_ok(uint64_t t, char* reasons, size_t reasons_sz) {
+  if (reasons && reasons_sz > 0) reasons[0] = '\0';
+
+  if (!xy_ctrl_ok(t)) append_reason(reasons, reasons_sz, "xy_ctrl_unhealthy");
+  if (!have_att) append_reason(reasons, reasons_sz, "no_att");
+  if (!lpos_fresh(t)) append_reason(reasons, reasons_sz, "lpos_stale");
+  if (!isfinite(lpos_vx_mps) || !isfinite(lpos_vy_mps)) append_reason(reasons, reasons_sz, "vel_nan");
+  if (of_fresh(t) && of_quality < 30) append_reason(reasons, reasons_sz, "flow_q_low");
+  if (isnan(alt_max_m) || alt_max_m < HOVER_CAPTURE_MIN_ALT_M) append_reason(reasons, reasons_sz, "alt_too_low");
+  if (isfinite(lpos_vx_mps) && fabsf(lpos_vx_mps) >= VX_LOCK_MAX_MPS) append_reason(reasons, reasons_sz, "vx_high");
+  if (isfinite(lpos_vy_mps) && fabsf(lpos_vy_mps) >= VY_LOCK_MAX_MPS) append_reason(reasons, reasons_sz, "vy_high");
+
+  return reasons == NULL || reasons[0] == '\0';
 }
 
+static bool vel_xy_stable(uint64_t t) {
+  char reasons[160];
+  bool ok = vel_xy_motion_ok(t, reasons, sizeof(reasons));
+
+  if (ok) {
+    if (!xy_lock_candidate_active) {
+      xy_lock_candidate_active = true;
+      xy_lock_candidate_since_ms = t;
+      log_bootstrap_event(t, "XY_LOCK_CANDIDATE_START", "low_xy_velocity");
+    }
+    return (t - xy_lock_candidate_since_ms) >= XY_LOCK_DWELL_MS;
+  }
+
+  if (xy_lock_candidate_active) {
+    xy_lock_candidate_active = false;
+    xy_lock_candidate_since_ms = 0;
+    log_bootstrap_event(t, "XY_LOCK_CANDIDATE_FAIL", reasons);
+  }
+  return false;
+}
+
+// ----------------------------- Hover / PosHold -------------------------
 static void init_hover_targets_on_ground(uint64_t t) {
   (void)t;
   hover_xy_locked = false;
-  hover_xy_prelock_valid = false;
   hover_xy_lock_ms = 0;
   hover_lock_x_m = 0.0f;
   hover_lock_y_m = 0.0f;
-  hover_prelock_x_m = 0.0f;
-  hover_prelock_y_m = 0.0f;
+  xy_lock_candidate_active = false;
+  xy_lock_candidate_since_ms = 0;
+  hover_health_fail_since_ms = 0;
+  hover_ready_fail_log_ms = 0;
+  hover_ready_fail_last_reason[0] = '\0';
 
   if (have_att) {
     hover_hold_yaw_deg = current_heading_deg();
@@ -1065,40 +1237,24 @@ static void init_hover_targets_on_ground(uint64_t t) {
 static void hover_hold_tick(uint64_t t) {
   if (!have_att) return;
 
-  uint64_t lpos_age_ms = have_lpos ? (t - lpos_last_update_ms) : UINT64_MAX;
-  bool lpos_recent = lpos_age_ms < 400;
-
-  // Capture a prelock XY snapshot as soon as we have a fresh sample and are above the min altitude.
-  if (!hover_xy_prelock_valid && lpos_recent && isfinite(lpos_x_m) && isfinite(lpos_y_m) &&
-      !isnan(alt_max_m) && alt_max_m > HOVER_CAPTURE_MIN_ALT_M) {
-    hover_prelock_x_m = lpos_x_m;
-    hover_prelock_y_m = lpos_y_m;
-    hover_xy_prelock_valid = true;
-    printf("HOVER: prelock XY captured (x=%.2f y=%.2f)\n", hover_prelock_x_m, hover_prelock_y_m);
-  }
-
-  // Lock XY only after stability criteria are met.
-  if (!hover_xy_locked && vel_xy_stable(t)) {
-    if (hover_xy_prelock_valid) {
-      hover_lock_x_m = hover_prelock_x_m;
-      hover_lock_y_m = hover_prelock_y_m;
-    } else if (lpos_recent && isfinite(lpos_x_m) && isfinite(lpos_y_m)) {
-      hover_lock_x_m = lpos_x_m;
-      hover_lock_y_m = lpos_y_m;
-    }
+  bool lpos_ok = lpos_fresh(t) && isfinite(lpos_x_m) && isfinite(lpos_y_m);
+  if (!hover_xy_locked && vel_xy_stable(t) && lpos_ok) {
+    hover_lock_x_m = lpos_x_m;
+    hover_lock_y_m = lpos_y_m;
     hover_xy_locked = true;
     hover_xy_lock_ms = t;
-    printf("HOVER: XY LOCKED at x=%.2f y=%.2f\n", hover_lock_x_m, hover_lock_y_m);
+    xy_lock_candidate_active = false;
+    xy_lock_candidate_since_ms = 0;
+    log_bootstrap_event(t, "XY_LOCK_SUCCESS", "velocity_dwell_met");
   }
 
   float yaw = have_yaw_target ? yaw_target_deg : current_heading_deg();
   float z_down = hover_target_z_down();
 
-  if (!hover_xy_locked || !lpos_recent) {
-    // Always stream Z+Yaw even if XY data is missing; XY hold requires a fresh lock.
-    send_z_yaw_ned(z_down, yaw);
-  } else {
+  if (hover_xy_locked) {
     send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, z_down, yaw);
+  } else {
+    send_z_yaw_ned(z_down, yaw);
   }
 }
 
@@ -1962,10 +2118,10 @@ static void enter_state(State ns, const char* reason) {
 
   if (leaving_hover) {
     hover_xy_locked = false;
-    hover_xy_prelock_valid = false;
     hover_xy_lock_ms = 0;
     hover_lock_x_m = hover_lock_y_m = 0.0f;
-    hover_prelock_x_m = hover_prelock_y_m = 0.0f;
+    xy_lock_candidate_active = false;
+    xy_lock_candidate_since_ms = 0;
     printf("HOVER: reset XY capture (leaving %s)\n", state_name(ns));
   }
 
@@ -1983,6 +2139,7 @@ static void enter_state(State ns, const char* reason) {
     takeoff_att_ramp_active = false;
     takeoff_att_ramp_start_ms = 0;
     takeoff_alt0_m = alt_max_m;
+    takeoff_att_ramp_was_active = false;
 
     pending_kf_flags |= KF_TAKEOFF;
   }
@@ -1999,10 +2156,10 @@ static void enter_state(State ns, const char* reason) {
 
   if (entering_hover) {
     hover_xy_locked = false;
-    hover_xy_prelock_valid = false;
     hover_xy_lock_ms = 0;
     hover_lock_x_m = hover_lock_y_m = 0.0f;
-    hover_prelock_x_m = hover_prelock_y_m = 0.0f;
+    xy_lock_candidate_active = false;
+    xy_lock_candidate_since_ms = 0;
     printf("HOVER: reset XY capture (enter)\n");
   }
 
@@ -2028,6 +2185,7 @@ static void enter_state(State ns, const char* reason) {
   }
 
   st = ns;
+  sync_hover_phase(now_ms());
 }
 
 // ----------------------------- Forward decls ---------------------------
@@ -2177,9 +2335,14 @@ static void battery_failsafe_tick(uint64_t t) {
 // ----------------------------- Takeoff helpers -------------------------
 static bool takeoff_off_ground(uint64_t t) {
   bool rf_fresh = have_rangefinder && (t - rangefinder_last_update_ms) < 400;
-  if (have_ext && landed_state != MAV_LANDED_STATE_ON_GROUND) return true;
-  if (rf_fresh && !isnan(rangefinder_m) && rangefinder_m > 0.05f) return true;
-  if (!isnan(alt_max_m) && alt_max_m > 0.05f) return true;
+  bool landed_air = have_ext && landed_state != MAV_LANDED_STATE_ON_GROUND;
+
+  bool rf_ok = rf_fresh && !isnan(rangefinder_m) && rangefinder_m > 0.08f;
+  bool alt_ok = !isnan(alt_max_m) && alt_max_m > 0.08f;
+  bool rise_ok = (!isnan(takeoff_alt0_m) && !isnan(alt_max_m) && (alt_max_m - takeoff_alt0_m) > 0.05f);
+
+  if (rf_ok || alt_ok || rise_ok) return true;
+  if (landed_air && (rf_ok || alt_ok)) return true; // require some altitude evidence even if FC says IN_AIR
   return false;
 }
 
@@ -2390,7 +2553,19 @@ static void control_tick(void) {
 
     enter_state(ST_IDLE, "Unexpected Disarm");
   }
+
+  if (!fc_armed_prev && fc_armed) {
+    start_bootstrap_grace(t, "fc_armed");
+  }
+  if (fc_armed_prev && !fc_armed) {
+    bootstrap_grace_until_ms = 0;
+    bootstrap_grace_was_active = false;
+    hover_health_fail_since_ms = 0;
+  }
   fc_armed_prev = fc_armed;
+
+  poll_bootstrap_grace(t);
+  sync_hover_phase(t);
 
   // want_arm dropped while armed -> FORCE DISARM immediately (any state/mode)
   if (!want_arm && fc_armed) {
@@ -2400,7 +2575,7 @@ static void control_tick(void) {
     return;
   }
 
-  // Ceiling safety: always clamp down. Prefer full poshold if XY locked; otherwise Z-only.
+  // Ceiling safety: always clamp down. Use Z-only until XY has been explicitly locked.
   if (ceiling_active && fc_armed) {
     if (!have_yaw_target && have_att) {
       have_yaw_target = true;
@@ -2408,37 +2583,36 @@ static void control_tick(void) {
     }
     float yaw = have_yaw_target ? yaw_target_deg : (have_att ? current_heading_deg() : 0.0f);
     float safe_z = hover_target_z_down();
-
-    if (hover_xy_locked && have_att) {
-      send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, safe_z, yaw);
-    } else {
-      // Stay Z-only while XY not locked to avoid fighting bad estimates.
-      send_z_yaw_ned(safe_z, yaw);
-    }
+    if (hover_xy_locked) send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, safe_z, yaw);
+    else send_z_yaw_ned(safe_z, yaw);
     return;
   }
 
-  // Hover failsafe with hysteresis: require sustained stale inputs before LAND.
-  if (fc_armed && (st == ST_HOVER)) {
-    bool lpos_ok = have_lpos && (t - lpos_last_update_ms) < 400;
-    bool alt_ok  = !isnan(alt_max_m);
-    bool rf_ok   = have_rangefinder && (t - rangefinder_last_update_ms) < 400 && !isnan(rangefinder_m);
+  if (fc_armed && (st == ST_TAKEOFF || st == ST_HOVER)) {
+    HoverPhase phase = current_hover_phase();
+    bool strict_hover_checks = (phase == HPH_FULL_HOVER) && !bootstrap_grace_active(t);
+    uint64_t fail_limit_ms = strict_hover_checks ? FULL_HOVER_FAILSAFE_MS : BOOTSTRAP_FAILSAFE_MS;
+    char reasons[160];
+    bool ready = strict_hover_checks
+      ? hover_ready_now(t)
+      : hover_ready_now_internal(t, false, false, reasons, sizeof(reasons));
 
-    lpos_stale_count = lpos_ok ? 0 : (lpos_stale_count + 1);
-    alt_stale_count  = alt_ok  ? 0 : (alt_stale_count + 1);
-    rf_stale_count   = rf_ok   ? 0 : (rf_stale_count + 1);
+    if (strict_hover_checks && !ready) {
+      hover_ready_now_internal(t, true, false, reasons, sizeof(reasons));
+    }
 
-    bool lpos_fail = lpos_stale_count > STALE_FAIL_TICKS;
-    bool alt_fail  = alt_stale_count  > STALE_FAIL_TICKS;
-    bool rf_fail   = REQUIRE_RANGEFINDER_FOR_HOVER && (rf_stale_count > STALE_FAIL_TICKS);
-
-    if (lpos_fail || alt_fail || rf_fail) {
-      printf("FAILSAFE: pose/alt stale (lpos=%u rf=%u alt=%u) -> LANDING\n",
-             lpos_stale_count, rf_stale_count, alt_stale_count);
-      enter_state(ST_LANDING, "Failsafe (Sensors)");
+    if (ready) {
+      hover_health_fail_since_ms = 0;
+    } else {
+      if (hover_health_fail_since_ms == 0) hover_health_fail_since_ms = t;
+      if ((t - hover_health_fail_since_ms) >= fail_limit_ms) {
+        log_bootstrap_event(t, "LANDING_FAILSAFE", reasons);
+        enter_state(ST_LANDING, strict_hover_checks ? "Hover Health Fail" : "Bootstrap Health Fail");
+        return;
+      }
     }
   } else {
-    lpos_stale_count = rf_stale_count = alt_stale_count = 0;
+    hover_health_fail_since_ms = 0;
   }
 
   switch (st) {
@@ -2450,7 +2624,7 @@ static void control_tick(void) {
       if (want_arm && !arm_allowed_by_battery(t)) break;
 
       if (want_arm && !fc_armed) {
-        if (!hover_ready_stable(t)) {
+        if (!bootstrap_ready_stable(t)) {
           set_mode_guided();
           break;
         }
@@ -2473,7 +2647,7 @@ static void control_tick(void) {
         break;
       }
 
-      if (!hover_ready_stable(t)) {
+      if (!bootstrap_ready_stable(t)) {
         set_mode_guided();
         break;
       }
@@ -2491,19 +2665,8 @@ static void control_tick(void) {
     case ST_TAKEOFF: {
       if (hb_custom_mode != 4) set_mode_guided();
 
-      // One-shot XY capture (if not already captured)
-      if (!hover_xy_prelock_valid &&
-          have_lpos && (t - lpos_last_update_ms) < 400 &&
-          isfinite(lpos_x_m) && isfinite(lpos_y_m) &&
-          !isnan(alt_max_m) && alt_max_m > HOVER_CAPTURE_MIN_ALT_M) {
-        hover_prelock_x_m = lpos_x_m;
-        hover_prelock_y_m = lpos_y_m;
-        hover_xy_prelock_valid = true;
-        printf("HOVER: prelock XY (takeoff) x=%.2f y=%.2f\n", hover_prelock_x_m, hover_prelock_y_m);
-      }
-
       if (!takeoff_sent) {
-        guided_takeoff(TAKEOFF_TARGET_M); // single takeoff command, keep streaming position targets
+        guided_takeoff(TAKEOFF_TARGET_M);
         takeoff_sent = true;
         takeoff_sent_ms = t;
         if (isnan(takeoff_alt0_m)) {
@@ -2525,26 +2688,22 @@ static void control_tick(void) {
         takeoff_att_ramp_start_ms = t;
       }
 
-      // Stream setpoints only after the no-vel window and not while ramping.
-      bool allow_stream = takeoff_sent && (t - takeoff_sent_ms) >= TAKEOFF_NO_VEL_MS && !takeoff_att_ramp_active;
+      // Stream setpoints once past the no-vel window; allow during ramp so FC has a Z target.
+      bool allow_stream = takeoff_sent && (t - takeoff_sent_ms) >= TAKEOFF_NO_VEL_MS;
       if (allow_stream) {
         float yaw = have_yaw_target ? yaw_target_deg :
                     (have_att ? current_heading_deg() : 0.0f);
         float z_down = hover_target_z_down();
-
-        if (hover_xy_locked) {
-          send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, z_down, yaw);
-        } else {
-          send_z_yaw_ned(z_down, yaw);
-        }
+        send_z_yaw_ned(z_down, yaw);
       }
 
       // Run the attitude thrust ramp while waiting for lift
       takeoff_att_ramp_tick(t);
-      if (!takeoff_started && !takeoff_att_ramp_active) {
+      if (takeoff_att_ramp_active) takeoff_att_ramp_was_active = true;
+      if (!takeoff_started && takeoff_att_ramp_was_active && !takeoff_att_ramp_active) {
         // If we're already airborne (or motors clearly spooled) but missed the trigger, mark started.
         bool inferred_air = (have_ext && landed_state != MAV_LANDED_STATE_ON_GROUND) ||
-                            (!isnan(alt_max_m) && alt_max_m > 0.05f) ||
+                            (!isnan(alt_max_m) && alt_max_m > 0.08f) ||
                             (servo_fresh && mot_avg > (TAKEOFF_MOT_START_US + 150));
         if (inferred_air) {
           takeoff_started = true;
@@ -2553,6 +2712,8 @@ static void control_tick(void) {
             have_yaw_target = true;
             yaw_target_deg = current_heading_deg();
           }
+          start_bootstrap_grace(t, "takeoff_started");
+          log_bootstrap_event(t, "TAKEOFF_START", "ramp_inferred");
           printf("TAKEOFF: ramp ended, inferring liftoff (altMAX=%.2f mot_avg=%.1f)\n",
                  alt_max_m, mot_avg);
         } else {
@@ -2570,6 +2731,8 @@ static void control_tick(void) {
           have_yaw_target = true;
           yaw_target_deg = current_heading_deg();
         }
+        start_bootstrap_grace(t, "takeoff_started");
+        log_bootstrap_event(t, "TAKEOFF_START", mot_started ? "motor_start" : "off_ground");
         printf("TAKEOFF: started (mot_avg=%.1f, altMAX=%.2f, landed=%u(%s))\n",
                servo_fresh ? mot_avg : -1.0f,
                alt_max_m,
@@ -2602,8 +2765,9 @@ static void control_tick(void) {
         yaw_target_deg = current_heading_deg();
       }
 
-      // Continuous hover clamp: Z always; XY once locked.
+      // Continuous hover clamp: Z-only until XY lock, then full XYZ hold.
       hover_hold_tick(t);
+      sync_hover_phase(t);
     } break;
 
     case ST_LANDING: {
