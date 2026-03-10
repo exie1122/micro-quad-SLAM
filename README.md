@@ -22,7 +22,13 @@ MicoAir H743 45A V2 AIO (sensor fusion + optical flow)
 Motors: 1103 11000kv   
 Frame: 2" Carbon Fiber   
 
-
+# Version 3:
+Waveshare ESP32-S3 Zero (sensor hub)   
+LicheeRV Nano (occupancy grid + mapping + vision)   
+MicoAir H743 45A V2 AIO (sensor fusion + optical flow)   
+Motors: 1202.5 11500kv   
+Frame: 2.5" Carbon Fiber   
+Propellers: 2.5" Bi-blade
 
 
 January 30, 2026 Changes   
@@ -44,6 +50,7 @@ ATC_RAT_YAW_D = 0.0
 
 # Notes
 Quadcopter was the most stable in hover mode with the Jan 28th code/commit.
+
 
 
 
