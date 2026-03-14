@@ -53,6 +53,12 @@ Quadcopter was the most stable in hover mode with the Jan 28th code/commit.
 
 
 
+# Compile Commands   
+riscv64-linux-gnu-gcc -Os -std=gnu11 -w -static -ffunction-sections -fdata-sections -Wl,--gc-sections -I"$HOME/c_library_v2" clean_uav_fc_tof_nav.c -o uav_fc_tof_nav_riscv_static -lm   
+
+
+
+
 
 
 
