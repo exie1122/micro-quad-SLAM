@@ -496,6 +496,11 @@ def compute_points(
                 np.cos(body_elevation_rad) * np.sin(body_azimuth_rad),
                 np.sin(body_elevation_rad),
             ))
+            sensor_forward_comp = np.cos(body_elevation_rad) * np.cos(
+                np.radians(corrected_azimuth_deg)
+            )
+            sensor_forward_comp = np.clip(sensor_forward_comp, 1e-4, None)
+            scale = dists_m / sensor_forward_comp
         else:
             planar_d = dists_m * elev_corrections[zone_idx_in_sensor]
             ray_body = np.column_stack((
@@ -514,8 +519,8 @@ def compute_points(
         sensor_origins_x = drone_x + sensor_offsets_world[:, 0]
         sensor_origins_y = drone_y + sensor_offsets_world[:, 1]
         if use_3d_ray_rotation:
-            px = sensor_origins_x + dists_m * ray_world[:, 0]
-            py = sensor_origins_y + dists_m * ray_world[:, 1]
+            px = sensor_origins_x + scale * ray_world[:, 0]
+            py = sensor_origins_y + scale * ray_world[:, 1]
         else:
             px = sensor_origins_x + ray_world[:, 0]
             py = sensor_origins_y + ray_world[:, 1]
