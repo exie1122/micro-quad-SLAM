@@ -2,22 +2,22 @@
 
 ## Overview
 
-This project investigates whether a nano-scale quadcopter can perform autonomous indoor localization and mapping without GPS under strict size, power, and computational constraints.
+This project investigates whether a nano-scale quadcopter can perform indoor localization and mapping without GPS under strict size, power, and computational constraints.
 
-The system combines optical flow velocity estimation, time-of-flight (ToF) depth sensing, and a lightweight companion-computer pipeline to reconstruct a 2D map of the environment from flight data.
+The system combines optical flow velocity estimation, time-of-flight (ToF) depth sensing, and a lightweight companion-computer logging pipeline to reconstruct a 2D map of the environment from flight data.
 
-The goal is to enable small UAVs to operate in GPS-denied environments for applications such as search-and-rescue (SAR), structural inspection, and confined-space exploration.
+The goal is to explore whether a highly constrained nano-quadcopter platform can support GPS-denied navigation and mapping for applications such as search-and-rescue, structural inspection, and confined-space exploration.
 
 ---
 
 ## Features
 
-- GPS-denied indoor navigation  
-- Optical flow-based velocity estimation  
-- Multi-sensor ToF depth acquisition (VL53L5CX array)  
-- Modular sensor + compute architecture  
-- Companion-computer data logging pipeline  
-- Post-flight 2D mapping reconstruction  
+- GPS-denied indoor flight
+- Optical flow-based velocity estimation
+- ToF-based environment sensing
+- Modular sensor and compute architecture
+- Companion-computer logging pipeline
+- Post-flight 2D map reconstruction
 
 ---
 
@@ -25,16 +25,17 @@ The goal is to enable small UAVs to operate in GPS-denied environments for appli
 
 The system consists of three main subsystems:
 
-1. Flight Controller  
-   Stabilization and low-level control (ArduPilot-based)
+1. **Flight Controller**  
+   Handles stabilization and low-level control
 
-2. Sensor Hub (ESP32-S3)  
-   Aggregates ToF and auxiliary sensor data
+2. **Sensor Hub (ESP32-S3)**  
+   Collects and transmits ToF and related sensor data
 
-3. Companion Computer (LicheeRV Nano)  
-   Handles logging and mapping pipeline
+3. **Companion Computer (LicheeRV Nano / earlier Luckfox Pico Mini B)**  
+   Logs flight and sensor data for post-flight reconstruction and analysis
 
-Data flow:  
+Data flow:
+
 Sensors → ESP32-S3 → Companion Computer → Post-processing → 2D Map
 
 ---
@@ -42,39 +43,38 @@ Sensors → ESP32-S3 → Companion Computer → Post-processing → 2D Map
 ## Hardware
 
 ### Version 1
+
 | Component | Part |
 |-----------|------|
 | Sensor Hub | Waveshare ESP32-S3 Zero |
-| Mapping SBC | Luckfox Pico Mini B |
+| Mapping / Vision SBC | Luckfox Pico Mini B |
 | Flight Controller | MicoAir H743 45A V2 AIO |
 | Motors | 1202.5 11500KV |
-| Frame | 85mm Mobula8 Whoop |
-
----
+| Frame | 85mm Mobula8 Whoop Frame |
 
 ### Version 2
+
 | Component | Part |
 |-----------|------|
 | Sensor Hub | Waveshare ESP32-S3 Zero |
-| Mapping SBC | LicheeRV Nano |
+| Mapping / Vision SBC | LicheeRV Nano |
 | Flight Controller | MicoAir H743 45A V2 AIO |
 | Motors | 1103 11000KV |
 | Frame | 2" Carbon Fiber |
 
----
-
 ### Version 3 (Current)
+
 | Component | Part |
 |-----------|------|
 | Sensor Hub | Waveshare ESP32-S3 Zero |
-| Mapping SBC | LicheeRV Nano |
+| Mapping / Vision SBC | LicheeRV Nano |
 | Flight Controller | MicoAir H743 45A V2 AIO |
 | Motors | 1202.5 11500KV |
 | Frame | 2.5" Carbon Fiber |
 | Propellers | 2.5" Bi-blade |
 
 Approximate AUW: ~135g  
-Battery: 2S LiHV  
+Battery: 2S LiHV
 
 ---
 
@@ -82,7 +82,7 @@ Battery: 2S LiHV
 
 ### January 30, 2026
 
-Roll & Pitch
+### Roll & Pitch
 
 | Parameter | Value |
 |-----------|-------|
@@ -93,7 +93,7 @@ Roll & Pitch
 | ATC_RAT_RLL_D | 0.0045 |
 | ATC_RAT_PIT_D | 0.0045 |
 
-Yaw
+### Yaw
 
 | Parameter | Value |
 |-----------|-------|
@@ -109,10 +109,11 @@ Test flights were conducted in small indoor environments.
 
 Key observations:
 
-- Stable hover achieved using optical flow velocity estimation  
-- Short-duration mapping is feasible (~60-120 seconds)  
-- Accumulated drift remains the primary limitation  
-- ToF frame distortion introduces curvature artifacts in mapping  
+- Stable hover was achieved using optical flow-based velocity estimation
+- Short-duration mapping is feasible on a nano-scale platform
+- Drift accumulation remains a major limitation
+- ToF sensing introduces distortion and curvature artifacts in reconstructed maps
+- The project demonstrates the practicality of modular indoor mapping on a constrained quadcopter platform
 
 ---
 
@@ -122,53 +123,25 @@ Key observations:
 
 ---
 
+## Repository Structure
+
+- `README.md` — project overview, hardware versions, tuning notes, and results
+- `clean_uav_fc_tof_nav.c` — autonomous flight and navigation code
+- `manual_uav_fc_tof_nav.c` — manual flight controller version with logging
+- `uav_local_nav.c` — local navigation logic
+- `plot_scan.py` — mapping / scan visualization script
+- `tof_esp32.ino` — ESP32 sensor hub firmware
+- `m5stack_armDisarm.ino` — M5Stack arm/disarm helper
+- `image (9).png` — example mapped environment output
+
+---
+
 ## Build
 
 ### Compile Command
 
+```bash
 riscv64-linux-gnu-gcc -Os -std=gnu11 -w -static \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -I"$HOME/c_library_v2" \
   clean_uav_fc_tof_nav.c -o uav_fc_tof_nav_riscv_static -lm
-
----
-
-## Repository Structure
-
-src/  
-    uav_fc_tof_nav.c  
-    sensor interface code  
-
-logs/  
-    flight logs  
-    sensor captures  
-
-tools/  
-    visualization / mapping scripts  
-
----
-
-## Limitations
-
-- Drift accumulation over time (no global correction)  
-- Limited compute prevents real-time SLAM  
-- Sensor FOV distortion affects map accuracy  
-- Short flight duration due to size constraints  
-
----
-
-## Future Work
-
-- Scan-to-scan matching (ICP / graph-based SLAM)  
-- Sensor fusion improvements (full 3D ray projection)  
-- Drift correction using loop closure  
-- Real-time onboard mapping  
-- Weight reduction and efficiency optimization  
-
----
-
-## Citation
-
-If referencing this project:
-
-Ethan Xie. Indoor GPS-Denied Nano-Quadcopter Mapping. 2026.
