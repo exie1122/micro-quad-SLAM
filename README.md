@@ -110,7 +110,7 @@ Test flights were conducted in small indoor environments.
 Key observations:
 
 - Stable hover achieved using optical flow velocity estimation  
-- Short-duration mapping is feasible (~20–40 seconds)  
+- Short-duration mapping is feasible (~60-120 seconds)  
 - Accumulated drift remains the primary limitation  
 - ToF frame distortion introduces curvature artifacts in mapping  
 
