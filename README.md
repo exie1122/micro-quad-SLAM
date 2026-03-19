@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project investigates whether a nano-scale quadcopter can perform indoor localization and mapping without GPS under strict size, power, and computational constraints.
+This project investigates whether a nano-scale quadcopter can perform autonomous indoor localization and mapping without GPS under strict size, power, and computational constraints.
 
 The system combines optical flow velocity estimation, time-of-flight (ToF) depth sensing, and a lightweight companion-computer logging pipeline to reconstruct a 2D map of the environment from flight data.
 
