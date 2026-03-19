@@ -120,7 +120,7 @@ Key observations:
 ## Mapped Environment
 
 ![Autonomously mapped environment](image%20(9).png)
-![Autonomously mapped environment](mapped_environment_2.png)
+![Autonomously mapped environment](Figure_1.png)
 
 ---
 
