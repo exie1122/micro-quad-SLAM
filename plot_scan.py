@@ -2,8 +2,11 @@ import struct
 import sys
 import math
 import argparse
-import tkinter as tk
-from tkinter import filedialog
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except ImportError:
+    tk = None
 
 try:
     import numpy as np
@@ -21,6 +24,10 @@ DEFAULT_LOG_FILE = "scanlog.bin"
 GRID_SIZE_M = 20.0  # Approx size of plot in meters
 MAX_DISPLAY_POINTS = 200000
 MAX_TRAJECTORY_POINTS = 20000
+OCCUPANCY_CELL_SIZE_M = 0.10
+OCCUPANCY_SATURATION_HITS = 8.0
+MIN_OCCUPANCY_CELL_SIZE_M = 0.05
+MAX_OCCUPANCY_CELL_SIZE_M = 0.25
 # VL53L5CX config
 NUM_SENSORS = 4
 ZONES_PER_SENSOR = 64 # 8x8
@@ -30,10 +37,11 @@ FOV_H = 45.0 # Degrees
 FOV_V = 45.0 # Degrees
 MIDDLE_ROWS_ONLY = True
 MIDDLE_ROW_INDICES = {3, 4}
+DEFAULT_ROW_MODE = "both"
 # Logged sensor order is Front, Right, Back, Left.
 SENSOR_NAMES = ["Front", "Right", "Back", "Left"]
 SENSOR_COLORS = ["tab:blue", "tab:orange", "tab:green", "tab:purple"]
-ENABLED_SENSOR_MASK = np.array([True, True, False, True], dtype=bool)
+ENABLED_SENSOR_MASK = np.array([True, True, True, True], dtype=bool)
 # Body-frame convention for sensor offsets:
 #   +X = forward, +Y = right
 # Fill these from measured frame geometry. Defaults are zero to preserve the
@@ -48,13 +56,15 @@ DEFAULT_SENSOR_OFFSETS_BODY_XY_M = np.array([
 # clockwise in this viewer's X/Y convention.
 DEFAULT_SENSOR_YAW_TRIMS_DEG = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 DEFAULT_COLUMN_AZ_OFFSETS_DEG = np.zeros((NUM_SENSORS, COLS), dtype=np.float32)
+OUTLIER_REJECT_RADIUS_M = 0.2 #lower = more aggressive
+OUTLIER_REJECT_MIN_NEIGHBORS = 3 #higher = more aggressive
 MANHATTAN_MIN_SENSOR_POINTS = 4
 MANHATTAN_MIN_CONTRIBUTING_SENSORS = 2
 MANHATTAN_MIN_LINEARITY = 3.0
 MANHATTAN_MAX_CORRECTION_DEG = 25.0
 MANHATTAN_CORRECTION_GAIN = 0.45
 MANHATTAN_MAX_STEP_DEG = 6.0
-DEFAULT_FILTER_AGGRESSIVENESS = 1.0
+DEFAULT_FILTER_AGGRESSIVENESS = 2.0
 MAP_MIN_RANGE_M = 0.15
 MAP_MAX_RANGE_M = 3.50
 MANHATTAN_MIN_RANGE_M = 0.20
@@ -65,6 +75,9 @@ MAX_LPOS_AGE_MS = 400
 MAX_OF_AGE_MS = 400
 MAX_RF_AGE_MS = 400
 MAX_ABS_TILT_RAD = 0.40
+MIN_STABLE_ALT_M = 0.12
+STABLE_HOVER_VZ_THRESH = 0.15
+STABLE_HOVER_CONSEC_FRAMES = 3
 POSEF_FC_LINK = 1 << 0
 POSEF_FC_ARMED = 1 << 1
 POSEF_ATT_FRESH = 1 << 2
@@ -166,7 +179,31 @@ def nearest_manhattan_axis_deg(angle_deg):
     return 90.0 * round(angle_deg / 90.0)
 
 
-def build_filter_profile(aggressiveness):
+def row_mode_to_indices(row_mode):
+    if row_mode == "r3":
+        return {3}
+    if row_mode == "r4":
+        return {4}
+    return set(MIDDLE_ROW_INDICES)
+
+
+def row_mode_label(row_mode):
+    if row_mode == "r3":
+        return "R3"
+    if row_mode == "r4":
+        return "R4"
+    return "Both"
+
+
+def next_row_mode(row_mode):
+    if row_mode == "both":
+        return "r3"
+    if row_mode == "r3":
+        return "r4"
+    return "both"
+
+
+def build_filter_profile(aggressiveness, use_startup_filter=True):
     a = float(np.clip(aggressiveness, 0.0, 2.0))
     return {
         'aggressiveness': a,
@@ -181,7 +218,29 @@ def build_filter_profile(aggressiveness):
         'max_rf_age_ms': int(round(650 - 250 * a)),
         'max_abs_tilt_rad': max(0.18, 0.60 - 0.20 * a),
         'manhattan_min_linearity': 2.0 + 1.0 * a,
+        'use_startup_filter': use_startup_filter,
+        'stable_hover_t_ms': 0,
     }
+
+
+def compute_stable_hover_t_ms(records):
+    """Find the timestamp of the first frame where alt >= MIN_STABLE_ALT_M
+    and |vz| < STABLE_HOVER_VZ_THRESH for STABLE_HOVER_CONSEC_FRAMES
+    consecutive frames. Returns 0 if no startup exclusion is needed."""
+    n = len(records)
+    if n < STABLE_HOVER_CONSEC_FRAMES:
+        return 0
+    consec = 0
+    for i, rec in enumerate(records):
+        if (rec['alt'] >= MIN_STABLE_ALT_M
+                and abs(rec['vz']) < STABLE_HOVER_VZ_THRESH):
+            consec += 1
+            if consec >= STABLE_HOVER_CONSEC_FRAMES:
+                first_stable = i - STABLE_HOVER_CONSEC_FRAMES + 1
+                return records[first_stable]['t_ms']
+        else:
+            consec = 0
+    return 0
 
 
 def frame_pose_is_usable(rec, filter_profile):
@@ -205,10 +264,21 @@ def frame_pose_is_usable(rec, filter_profile):
         return False
     if abs(rec['pitch']) > filter_profile['max_abs_tilt_rad']:
         return False
+    if filter_profile.get('use_startup_filter', True):
+        stable_t = filter_profile.get('stable_hover_t_ms', 0)
+        if stable_t > 0 and rec['t_ms'] < stable_t:
+            return False
     return True
 
 
-def extract_frame_measurements(rec, row_indices, col_indices, min_range_m, max_range_m):
+def extract_frame_measurements(
+    rec,
+    row_indices,
+    col_indices,
+    min_range_m,
+    max_range_m,
+    row_filter_indices=None,
+):
     raw_dist = np.frombuffer(rec['grid_bytes'], dtype=np.uint16)
     min_mm = int(min_range_m * 1000.0)
     max_mm = int(max_range_m * 1000.0)
@@ -228,8 +298,10 @@ def extract_frame_measurements(rec, row_indices, col_indices, min_range_m, max_r
     sensor_idx = sensor_idx[sensor_mask]
     zone_idx_in_sensor = zone_idx_in_sensor[sensor_mask]
 
-    if MIDDLE_ROWS_ONLY:
-        row_mask = np.isin(row_indices[zone_idx_in_sensor], list(MIDDLE_ROW_INDICES))
+    if row_filter_indices is None and MIDDLE_ROWS_ONLY:
+        row_filter_indices = set(MIDDLE_ROW_INDICES)
+    if row_filter_indices is not None:
+        row_mask = np.isin(row_indices[zone_idx_in_sensor], list(row_filter_indices))
         if not np.any(row_mask):
             return None
         dists_mm = dists_mm[row_mask]
@@ -237,6 +309,20 @@ def extract_frame_measurements(rec, row_indices, col_indices, min_range_m, max_r
         zone_idx_in_sensor = zone_idx_in_sensor[row_mask]
 
     return dists_mm, sensor_idx, zone_idx_in_sensor
+
+
+def reject_isolated_points(px, py, sensor_idx, radius_m, min_neighbors):
+    if len(px) == 0 or min_neighbors <= 0:
+        return px, py, sensor_idx
+    if len(px) <= min_neighbors:
+        return np.array([], dtype=px.dtype), np.array([], dtype=py.dtype), np.array([], dtype=sensor_idx.dtype)
+
+    pts = np.column_stack((px, py))
+    deltas = pts[:, None, :] - pts[None, :, :]
+    dist2 = np.sum(deltas * deltas, axis=2)
+    neighbor_counts = np.count_nonzero(dist2 <= (radius_m * radius_m), axis=1) - 1
+    keep_mask = neighbor_counts >= min_neighbors
+    return px[keep_mask], py[keep_mask], sensor_idx[keep_mask]
 
 
 def build_projection_tables():
@@ -293,6 +379,7 @@ def frame_body_points(
     azimuth_offsets,
     row_indices,
     col_indices,
+    row_filter_indices=None,
 ):
     if not frame_pose_is_usable(rec, filter_profile):
         return None
@@ -303,6 +390,7 @@ def frame_body_points(
         col_indices,
         filter_profile['manhattan_min_range_m'],
         filter_profile['manhattan_max_range_m'],
+        row_filter_indices=row_filter_indices,
     )
     if measurements is None:
         return None
@@ -333,6 +421,7 @@ def estimate_manhattan_yaw_corrections(
     sensor_yaw_trims_deg,
     column_az_offsets_deg,
     filter_profile,
+    row_filter_indices=None,
 ):
     elev_corrections, _elev_angles_rad, azimuth_offsets, row_indices, col_indices = build_projection_tables()
     corrections_deg = np.zeros(len(records), dtype=np.float32)
@@ -349,6 +438,7 @@ def estimate_manhattan_yaw_corrections(
             azimuth_offsets,
             row_indices,
             col_indices,
+            row_filter_indices=row_filter_indices,
         )
         if frame is None:
             continue
@@ -412,6 +502,7 @@ def compute_points(
     yaw_corrections_deg=None,
     use_3d_ray_rotation=True,
     filter_profile=None,
+    row_filter_indices=None,
 ):
     """
     Convert raw ToF grid data + Pose into global 2D (x,y) points.
@@ -468,6 +559,7 @@ def compute_points(
             col_indices,
             filter_profile['map_min_range_m'],
             filter_profile['map_max_range_m'],
+            row_filter_indices=row_filter_indices,
         )
         if measurements is None:
             frame_indices.append(len(all_points_x))
@@ -524,6 +616,17 @@ def compute_points(
         else:
             px = sensor_origins_x + ray_world[:, 0]
             py = sensor_origins_y + ray_world[:, 1]
+
+        px, py, sensor_idx = reject_isolated_points(
+            px,
+            py,
+            sensor_idx,
+            radius_m=OUTLIER_REJECT_RADIUS_M,
+            min_neighbors=OUTLIER_REJECT_MIN_NEIGHBORS,
+        )
+        if len(px) == 0:
+            frame_indices.append(len(all_points_x))
+            continue
         
         all_points_x.extend(px)
         all_points_y.extend(py)
@@ -548,6 +651,21 @@ def downsample_points(x, y, sensor_ids, limit):
 
     step = int(math.ceil(len(x) / float(limit)))
     return x[::step], y[::step], sensor_ids[::step]
+
+
+def build_occupancy_raster(points_x, points_y, xlim, ylim, cell_size_m):
+    if len(points_x) == 0:
+        return None, [xlim[0], xlim[1], ylim[0], ylim[1]]
+
+    x_edges = np.arange(xlim[0], xlim[1] + cell_size_m, cell_size_m, dtype=np.float32)
+    y_edges = np.arange(ylim[0], ylim[1] + cell_size_m, cell_size_m, dtype=np.float32)
+    if len(x_edges) < 2 or len(y_edges) < 2:
+        return None, [xlim[0], xlim[1], ylim[0], ylim[1]]
+
+    hist, _, _ = np.histogram2d(points_y, points_x, bins=[y_edges, x_edges])
+    raster = np.ma.masked_less_equal(hist.astype(np.float32), 0.0)
+    extent = [x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]]
+    return raster, extent
 
 
 def build_trajectory_arrays(records, filter_profile):
@@ -628,7 +746,14 @@ def frame_points_slice(frame_indices, frame_idx):
     return start_pt_idx, end_pt_idx
 
 
-def rebuild_points(records, column_offsets_deg, use_manhattan_yaw, use_3d_ray_rotation, filter_profile):
+def rebuild_points(
+    records,
+    column_offsets_deg,
+    use_manhattan_yaw,
+    use_3d_ray_rotation,
+    filter_profile,
+    row_filter_indices=None,
+):
     if use_manhattan_yaw:
         yaw_corrections_deg = estimate_manhattan_yaw_corrections(
             records,
@@ -636,6 +761,7 @@ def rebuild_points(records, column_offsets_deg, use_manhattan_yaw, use_3d_ray_ro
             DEFAULT_SENSOR_YAW_TRIMS_DEG,
             column_offsets_deg,
             filter_profile,
+            row_filter_indices=row_filter_indices,
         )
     else:
         yaw_corrections_deg = np.zeros(len(records), dtype=np.float32)
@@ -647,6 +773,7 @@ def rebuild_points(records, column_offsets_deg, use_manhattan_yaw, use_3d_ray_ro
         yaw_corrections_deg=yaw_corrections_deg,
         use_3d_ray_rotation=use_3d_ray_rotation,
         filter_profile=filter_profile,
+        row_filter_indices=row_filter_indices,
     )
 
 # -----------------------------------------------------------------------------
@@ -661,14 +788,17 @@ def plot_data(
     single_frame_only=False,
     use_manhattan_yaw=False,
     use_3d_ray_rotation=True,
+    use_startup_filter=True,
 ):
     if len(records) == 0:
         print("No records to plot.")
         return
 
-    filter_profile = build_filter_profile(DEFAULT_FILTER_AGGRESSIVENESS)
+    filter_profile = build_filter_profile(DEFAULT_FILTER_AGGRESSIVENESS, use_startup_filter=use_startup_filter)
+    if use_startup_filter:
+        filter_profile['stable_hover_t_ms'] = compute_stable_hover_t_ms(records)
     fig, ax = plt.subplots(figsize=(10, 8))
-    plt.subplots_adjust(bottom=0.34)
+    plt.subplots_adjust(bottom=0.40)
     traj_x_all, traj_y_all = build_trajectory_arrays(records, filter_profile)
     session_summary = compute_session_summary(records, filter_profile)
     view_state = {
@@ -676,6 +806,10 @@ def plot_data(
         'use_manhattan_yaw': use_manhattan_yaw,
         'use_3d_ray_rotation': use_3d_ray_rotation,
         'filter_aggressiveness': DEFAULT_FILTER_AGGRESSIVENESS,
+        'render_mode': 'points',
+        'occupancy_cell_size_m': OCCUPANCY_CELL_SIZE_M,
+        'row_mode': DEFAULT_ROW_MODE,
+        'use_startup_filter': use_startup_filter,
     }
     point_state = {
         'x': points_x,
@@ -697,6 +831,18 @@ def plot_data(
         sensor_scatters[sensor_idx] = ax.scatter(
             [], [], s=3, c=sensor_color, alpha=0.55, label=sensor_name
         )
+    occupancy_cmap = plt.cm.hot.copy()
+    occupancy_cmap.set_bad(alpha=0.0)
+    occupancy_img = ax.imshow(
+        np.ma.masked_all((2, 2), dtype=np.float32),
+        extent=[-1.0, 1.0, -1.0, 1.0],
+        origin='lower',
+        cmap=occupancy_cmap,
+        interpolation='nearest',
+        alpha=0.90,
+        visible=False,
+        zorder=1,
+    )
     trajectory, = ax.plot([], [], 'r-', linewidth=1, label='Trajectory')
     drone_marker, = ax.plot([], [], 'ro', markersize=5)
     
@@ -734,20 +880,59 @@ def plot_data(
         ax.set_xlim(-5, 5)
         ax.set_ylim(-5, 5)
 
-    # Slider
+    # Sliders and buttons
     axcolor = 'lightgoldenrodyellow'
-    ax_time = plt.axes([0.25, 0.18, 0.60, 0.03], facecolor=axcolor)
-    ax_toggle = plt.axes([0.02, 0.16, 0.16, 0.05])
+    time_max = len(records) - 1
+
+    # Row 6 (top slider row): Cell size + Frame
+    ax_cell = plt.axes([0.25, 0.30, 0.60, 0.03], facecolor=axcolor)
+    s_cell = Slider(
+        ax_cell,
+        'Cell (m)',
+        MIN_OCCUPANCY_CELL_SIZE_M,
+        MAX_OCCUPANCY_CELL_SIZE_M,
+        valinit=OCCUPANCY_CELL_SIZE_M,
+        valstep=0.01,
+        dragging=True,
+    )
+    # Row 5: Frame slider (single-frame mode)
+    ax_time = plt.axes([0.25, 0.24, 0.60, 0.03], facecolor=axcolor)
+    try:
+        s_time = Slider(ax_time, 'Frame', 0, time_max, valinit=0, valstep=1, dragging=False)
+    except TypeError:
+        s_time = Slider(ax_time, 'Frame', 0, time_max, valinit=0, valstep=1)
+    # Row 4: Accum Start / End range sliders
+    ax_range_start = plt.axes([0.25, 0.19, 0.60, 0.03], facecolor=axcolor)
+    try:
+        s_range_start = Slider(ax_range_start, 'Start', 0, time_max, valinit=0, valstep=1, dragging=False)
+    except TypeError:
+        s_range_start = Slider(ax_range_start, 'Start', 0, time_max, valinit=0, valstep=1)
+    ax_range_end = plt.axes([0.25, 0.14, 0.60, 0.03], facecolor=axcolor)
+    try:
+        s_range_end = Slider(ax_range_end, 'End', 0, time_max, valinit=time_max, valstep=1, dragging=False)
+    except TypeError:
+        s_range_end = Slider(ax_range_end, 'End', 0, time_max, valinit=time_max, valstep=1)
+    # Row 3: buttons + filter slider
+    ax_toggle = plt.axes([0.02, 0.22, 0.16, 0.05])
     btn_toggle = Button(ax_toggle, 'View: Frame' if single_frame_only else 'View: Accum')
     ax_manhattan = plt.axes([0.02, 0.10, 0.16, 0.05])
     btn_manhattan = Button(
         ax_manhattan,
         'Manhattan: On' if use_manhattan_yaw else 'Manhattan: Off',
     )
+    ax_rows = plt.axes([0.02, 0.03, 0.16, 0.05])
+    btn_rows = Button(ax_rows, f'Rows: {row_mode_label(DEFAULT_ROW_MODE)}')
     ax_ray = plt.axes([0.25, 0.10, 0.16, 0.05])
     btn_ray = Button(
         ax_ray,
         '3D Rays: On' if use_3d_ray_rotation else '3D Rays: Off',
+    )
+    ax_render = plt.axes([0.25, 0.03, 0.16, 0.05])
+    btn_render = Button(ax_render, 'Render: Points')
+    ax_startup = plt.axes([0.48, 0.03, 0.18, 0.05])
+    btn_startup = Button(
+        ax_startup,
+        'Startup Filter: On' if use_startup_filter else 'Startup Filter: Off',
     )
     ax_filter = plt.axes([0.48, 0.10, 0.37, 0.03], facecolor=axcolor)
     ax_filter.axvline(DEFAULT_FILTER_AGGRESSIVENESS, color='red', linewidth=1.5, zorder=0)
@@ -761,24 +946,39 @@ def plot_data(
         dragging=True,
     )
     
-    time_max = len(records) - 1
-    try:
-        s_time = Slider(ax_time, 'Frame', 0, time_max, valinit=0, valstep=1, dragging=False)
-    except TypeError:
-        s_time = Slider(ax_time, 'Frame', 0, time_max, valinit=0, valstep=1)
-    
     def update(val):
         frame_idx = int(s_time.val)
-        
+
         if view_state['single_frame_only']:
             start_pt_idx, end_pt_idx = frame_points_slice(point_state['frame_indices'], frame_idx)
         else:
-            start_pt_idx = 0
-            end_pt_idx = point_state['frame_indices'][frame_idx + 1]
+            range_start = int(s_range_start.val)
+            range_end = int(s_range_end.val)
+            start_pt_idx = point_state['frame_indices'][range_start]
+            end_pt_idx = point_state['frame_indices'][min(range_end + 1, len(records))]
 
         current_x = point_state['x'][start_pt_idx:end_pt_idx]
         current_y = point_state['y'][start_pt_idx:end_pt_idx]
         current_sensor_ids = point_state['sensor_ids'][start_pt_idx:end_pt_idx]
+
+        if view_state['render_mode'] == 'grid':
+            raster, extent = build_occupancy_raster(
+                current_x,
+                current_y,
+                ax.get_xlim(),
+                ax.get_ylim(),
+                view_state['occupancy_cell_size_m'],
+            )
+            if raster is None:
+                occupancy_img.set_data(np.ma.masked_all((2, 2), dtype=np.float32))
+            else:
+                occupancy_img.set_data(raster)
+                occupancy_img.set_extent(extent)
+                occupancy_img.set_clim(vmin=1.0, vmax=OCCUPANCY_SATURATION_HITS)
+            occupancy_img.set_visible(True)
+        else:
+            occupancy_img.set_visible(False)
+
         disp_x, disp_y, disp_sensor_ids = downsample_points(
             current_x,
             current_y,
@@ -787,6 +987,9 @@ def plot_data(
         )
         
         for sensor_idx, scatter in sensor_scatters.items():
+            if view_state['render_mode'] == 'grid':
+                scatter.set_offsets(np.empty((0, 2)))
+                continue
             if len(disp_x) == 0:
                 scatter.set_offsets(np.empty((0, 2)))
                 continue
@@ -798,8 +1001,14 @@ def plot_data(
                 scatter.set_offsets(np.empty((0, 2)))
             
         # Update Trajectory
-        traj_x = point_state['traj_x'][:frame_idx + 1]
-        traj_y = point_state['traj_y'][:frame_idx + 1]
+        if view_state['single_frame_only']:
+            traj_start = 0
+            traj_end = frame_idx + 1
+        else:
+            traj_start = int(s_range_start.val)
+            traj_end = int(s_range_end.val) + 1
+        traj_x = point_state['traj_x'][traj_start:traj_end]
+        traj_y = point_state['traj_y'][traj_start:traj_end]
         traj_disp_x, traj_disp_y, _ = downsample_points(
             traj_x,
             traj_y,
@@ -809,14 +1018,24 @@ def plot_data(
         trajectory.set_data(traj_disp_x, traj_disp_y)
         
         # Update Drone Pos
-        drone_marker.set_data([records[frame_idx]['x']], [records[frame_idx]['y']])
-        mode_name = "Single Frame" if view_state['single_frame_only'] else "Accumulated"
+        if view_state['single_frame_only']:
+            drone_marker.set_data([records[frame_idx]['x']], [records[frame_idx]['y']])
+        else:
+            end_f = int(s_range_end.val)
+            drone_marker.set_data([records[end_f]['x']], [records[end_f]['y']])
+        if view_state['single_frame_only']:
+            mode_label = f"Frame {frame_idx + 1}/{len(records)}"
+        else:
+            mode_label = f"Accum [{int(s_range_start.val)}–{int(s_range_end.val)}]"
         title.set_text(
-            f"{mode_name} | Manhattan {'On' if view_state['use_manhattan_yaw'] else 'Off'} | "
+            f"{mode_label} | Render {'Grid' if view_state['render_mode'] == 'grid' else 'Points'} | "
+            f"Rows {row_mode_label(view_state['row_mode'])} | "
+            f"Manhattan {'On' if view_state['use_manhattan_yaw'] else 'Off'} | "
             f"3D Rays {'On' if view_state['use_3d_ray_rotation'] else 'Off'} | "
+            f"Startup {'On' if view_state['use_startup_filter'] else 'Off'} | "
             f"Filter {view_state['filter_aggressiveness']:.2f} | "
+            f"Cell {view_state['occupancy_cell_size_m']:.2f}m | "
             f"Valid Frames {point_state['session_summary']['valid_count']}/{len(records)} | "
-            f"Frame {frame_idx + 1}/{len(records)} | "
             f"Points shown {len(disp_x):,}/{len(current_x):,}"
         )
         summary_text.set_text(
@@ -838,13 +1057,21 @@ def plot_data(
         update(s_time.val)
 
     def rebuild_projection():
-        profile = build_filter_profile(view_state['filter_aggressiveness'])
+        profile = build_filter_profile(
+            view_state['filter_aggressiveness'],
+            use_startup_filter=view_state['use_startup_filter'],
+        )
+        if view_state['use_startup_filter']:
+            profile['stable_hover_t_ms'] = compute_stable_hover_t_ms(records)
+        else:
+            profile['stable_hover_t_ms'] = 0
         new_x, new_y, new_sensor_ids, new_frame_indices, _ = rebuild_points(
             records,
             DEFAULT_COLUMN_AZ_OFFSETS_DEG,
             use_manhattan_yaw=view_state['use_manhattan_yaw'],
             use_3d_ray_rotation=view_state['use_3d_ray_rotation'],
             filter_profile=profile,
+            row_filter_indices=row_mode_to_indices(view_state['row_mode']),
         )
         point_state['x'] = new_x
         point_state['y'] = new_y
@@ -868,14 +1095,43 @@ def plot_data(
         )
         rebuild_projection()
 
+    def toggle_render_mode(_event):
+        view_state['render_mode'] = 'grid' if view_state['render_mode'] == 'points' else 'points'
+        btn_render.label.set_text(
+            'Render: Grid' if view_state['render_mode'] == 'grid' else 'Render: Points'
+        )
+        update(s_time.val)
+
+    def toggle_row_mode(_event):
+        view_state['row_mode'] = next_row_mode(view_state['row_mode'])
+        btn_rows.label.set_text(f'Rows: {row_mode_label(view_state["row_mode"])}')
+        rebuild_projection()
+
+    def toggle_startup_filter(_event):
+        view_state['use_startup_filter'] = not view_state['use_startup_filter']
+        btn_startup.label.set_text(
+            'Startup Filter: On' if view_state['use_startup_filter'] else 'Startup Filter: Off'
+        )
+        rebuild_projection()
+
     def update_filter_aggressiveness(_val):
         view_state['filter_aggressiveness'] = float(s_filter.val)
         rebuild_projection()
 
+    def update_cell_size(_val):
+        view_state['occupancy_cell_size_m'] = float(s_cell.val)
+        update(s_time.val)
+
+    s_cell.on_changed(update_cell_size)
     s_time.on_changed(update)
+    s_range_start.on_changed(update)
+    s_range_end.on_changed(update)
     btn_toggle.on_clicked(toggle_view)
     btn_manhattan.on_clicked(toggle_manhattan)
+    btn_rows.on_clicked(toggle_row_mode)
     btn_ray.on_clicked(toggle_ray_mode)
+    btn_startup.on_clicked(toggle_startup_filter)
+    btn_render.on_clicked(toggle_render_mode)
     s_filter.on_changed(update_filter_aggressiveness)
     update(0) # Init
     plt.show()
@@ -898,7 +1154,7 @@ if __name__ == "__main__":
     filename = args.logfile
 
     # If no file provided, open file dialog
-    if not filename:
+    if not filename and tk is not None:
         try:
             root = tk.Tk()
             root.withdraw() # Hide the main window
@@ -920,6 +1176,7 @@ if __name__ == "__main__":
             print("No data found.")
             sys.exit(1)
         default_filter_profile = build_filter_profile(DEFAULT_FILTER_AGGRESSIVENESS)
+        default_filter_profile['stable_hover_t_ms'] = compute_stable_hover_t_ms(recs)
         active_sensor_names = [
             SENSOR_NAMES[i] for i in range(NUM_SENSORS) if ENABLED_SENSOR_MASK[i]
         ]
@@ -941,6 +1198,7 @@ if __name__ == "__main__":
             use_manhattan_yaw=args.manhattan_yaw,
             use_3d_ray_rotation=True,
             filter_profile=default_filter_profile,
+            row_filter_indices=row_mode_to_indices(DEFAULT_ROW_MODE),
         )
         plot_data(
             px,
