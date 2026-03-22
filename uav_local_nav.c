@@ -1,4 +1,4 @@
-//old code. do not use. change to either clean_uav_tof_nav.c or exploration.c (currently in the worsk)
+//old code. do not use. change to either clean_uav_tof_nav.c or exploration.c (currently in the works)
 
 
 
