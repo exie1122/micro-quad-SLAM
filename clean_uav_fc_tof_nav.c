@@ -1,21 +1,3 @@
-// uav_fc_local_nav.c  (stability-first “ETH-ish” single-drone behavior)
-//
-// STABILITY/DEMO REVISION:
-// - Hover-only behavior (exploration removed for minimal hover testing)
-// - XY lock now requires a continuous low-vx/low-vy dwell before freezing the hover anchor
-// - Always hold Z using a Z-only LOCAL_NED setpoint until XY has been explicitly locked
-// - Ceiling uses MAX of available altitude sources (RF and LPOS) so a “stuck-low” RF can’t hide a real climb
-// - DISARM: force-disarm immediately when want_arm drops (param2=21196), any state/mode
-// - Line-buffered stdout / unbuffered stderr for reliable logging
-// - Disable per-tick EXT_SYS_STATE spam by default (printing at 50Hz can wreck timing)
-// - The ToF ring is filtered and logged, but is not part of the hover stabilization control loop
-//
-// IMPORTANT NOTE:
-// Companion code can *request* poshold/althold, but if your FC estimator/OF/rangefinder is bad,
-// the FC will drift anyway. This script makes the companion-side behavior as strict as possible
-// (continuous setpoint streaming + gating), and failsafes to LAND if pose/alt is unhealthy.
-//CURRENT PROBLEM: DRONE ARMS, ACCELERATES ON THE Z AXIS, THEN CRASHES INTO THE CEILING. HOWEVER, AFTER SWITCHING TO 2.5" PROPELLORS, THE STABILITY ISSUE IS FIXED. 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -29,6 +11,7 @@
 #include <math.h>
 #include <time.h>
 #include <stdarg.h>
+#include <signal.h>
 
 #include "common/mavlink.h"
 
@@ -49,17 +32,23 @@
 #define ORIENT_DOWNWARD_FACING 25
 
 // ----------------------------- Logging paths ---------------------------
-#define LOG_CSV_PATH      "/mnt/sdcard/navlog.csv"
-#define LOG_SCAN_PATH     "/mnt/sdcard/scanlog.bin"
-#define LOG_TXT_PATH      "log.txt"
-#define LOG_HZ            20
-#define LOG_FLUSH_MS      1000
+#define LOG_CSV_PATH          "/mnt/sdcard/navlog.csv"
+#define LOG_SCAN_PATH         "/mnt/sdcard/scanlog.bin"
+#define LOG_TXT_PATH          "/mnt/sdcard/log.txt"
+#define LOG_HZ                20
+#define LOG_FLUSH_MS          1000
+#define SCAN_PENDING_MAX_MS   250
+#define POSE_RING_SZ          32
+#define HEARTBEAT_TIMEOUT_MS  3000
 
 static FILE* log_fp  = NULL;
 static FILE* scan_fp = NULL;
 static FILE* txt_log_fp = NULL;
-static uint64_t last_log_ms   = 0;
-static uint64_t last_flush_ms = 0;
+static uint64_t last_log_ms    = 0;
+static uint64_t last_flush_ms  = 0;
+static uint64_t session_start_ms = 0;
+
+static volatile sig_atomic_t g_shutdown = 0;
 
 // ----------------------------- ToF frame ------------------------------
 #define SCAN_HEADER 0xA5
@@ -101,10 +90,10 @@ static float tof_filt_m[4] = { NAN,NAN,NAN,NAN };  // filtered dir-min
 
 // -------------------------- Stability-first params ---------------------
 // Hover/PosHold parameters (indoor stability-first)
-static const float HOVER_TARGET_M = 0.45f;          // desired hover height (meters above ground)
-static const float TAKEOFF_TARGET_M = 0.35f;        // first stop when climbing
-static const float CEIL_M = 0.90f;                  // hard max altitude (meters)
-static const float CEIL_MARGIN_M = 0.05f;            // margin to command descent before the ceiling
+static const float HOVER_TARGET_M = 0.65f;          // desired hover height (meters above ground)
+static const float TAKEOFF_TARGET_M = 0.50f;        // first stop when climbing
+static const float CEIL_M = 0.95f;                  // hard max altitude (meters)
+static const float CEIL_MARGIN_M = 0.20f;            // start ceiling protection well before the hard ceiling
 static const float HOVER_CAPTURE_MIN_ALT_M = 0.15f;  // don't lock XY until clearly airborne
 static const uint64_t PREARM_STABLE_MS = 400;       // require sensors/control stable before arming
 static const bool REQUIRE_RANGEFINDER_FOR_HOVER = true;
@@ -138,13 +127,17 @@ static const float    ASSIST_MOTOR_DELTA_MIN = 15.0f; // lower delta threshold
 // ---------------------- TAKEOFF gating + thrust ramp -------------------
 #define PRINT_LANDED_STATE_EACH_TICK 0  // set to 1 only for short debugging; hurts timing at 50Hz
 
-static const uint64_t TAKEOFF_NO_VEL_MS        = 400;     // shorter pause before we start streaming setpoints
 static const uint64_t TAKEOFF_RAMP_DELAY_MS    = 700;     // start ramp a bit sooner
 static const float    TAKEOFF_MOT_START_US      = 1150.0f;
 static const uint64_t TAKEOFF_TIMEOUT_MS        = 8000;
+static const uint64_t TAKEOFF_HANDOFF_OFFGROUND_MS = 400;
+static const float    TAKEOFF_HANDOFF_MAX_TILT_DEG = 20.0f;
+static const float    CEILING_DESCENT_BASE_MPS  = 0.50f;   // min descent speed at ceiling
+static const float    CEILING_DESCENT_MAX_MPS   = 2.50f;   // max descent command at ceiling
 
 static bool     takeoff_started                 = false;
 static uint64_t takeoff_started_ms              = 0;
+static uint64_t takeoff_off_ground_since_ms     = 0;
 static float    takeoff_alt0_m                  = NAN;    // altitude snapshot when NAV_TAKEOFF sent
 static bool     takeoff_att_ramp_was_active     = false;
 
@@ -254,10 +247,11 @@ static float    of_rate_y   = NAN;
 static uint64_t of_last_update_ms = 0;
 
 // Attitude
-static bool  have_att = false;
-static float roll_rad = 0.0f;
-static float pitch_rad = 0.0f;
-static float yaw_rad = 0.0f;
+static bool     have_att = false;
+static float    roll_rad = 0.0f;
+static float    pitch_rad = 0.0f;
+static float    yaw_rad = 0.0f;
+static uint64_t att_last_update_ms = 0;
 
 // Downward-facing rangefinder
 static bool     have_rangefinder = false;
@@ -331,6 +325,30 @@ static int        snap_head = 0;
 
 static void snap_add(uint64_t t);
 static void snap_dump(void);
+static bool takeoff_off_ground(uint64_t t);
+
+// ----------------------------- Pose ring (mapping) --------------------
+typedef struct {
+  uint64_t host_ms;
+  float    x_m;
+  float    y_m;
+  float    vx_mps;
+  float    vy_mps;
+  float    vz_mps;
+  float    alt_m;
+  float    lpos_alt_m;
+  float    lpos_alt_filt_m;
+  float    yaw_deg;
+  float    roll_rad;
+  float    pitch_rad;
+  uint8_t  alt_src;
+  uint8_t  valid_xy;
+  uint8_t  valid_att;
+} pose_sample_t;
+
+static pose_sample_t pose_ring[POSE_RING_SZ];
+static int           pose_ring_head  = 0;
+static int           pose_ring_count = 0;
 
 // ----------------------------- State machine ---------------------------
 typedef enum {
@@ -409,6 +427,7 @@ static char     hover_ready_fail_last_reason[160] = {0};
 static bool ceiling_active = false;
 static float alt_est_m = NAN;       // selected altitude estimate
 static float alt_max_m = NAN;       // MAX of available sources for ceiling safety
+static bool alt_rf_rejected = false;
 
 typedef enum {
   ALT_SRC_NONE = 0,
@@ -417,7 +436,34 @@ typedef enum {
   ALT_SRC_ON_GROUND
 } AltSrc;
 
-static AltSrc alt_src = ALT_SRC_NONE;
+typedef enum {
+  RF_SRC_NONE = 0,
+  RF_SRC_DISTANCE_SENSOR = 1,
+  RF_SRC_RANGEFINDER = 2
+} RangefinderSrc;
+
+typedef enum {
+  OF_SRC_NONE = 0,
+  OF_SRC_OPTICAL_FLOW = 1,
+  OF_SRC_OPTICAL_FLOW_RAD = 2
+} OpticalFlowSrc;
+
+enum {
+  POSEF_FC_LINK    = 1u << 0,
+  POSEF_FC_ARMED   = 1u << 1,
+  POSEF_ATT_FRESH  = 1u << 2,
+  POSEF_LPOS_FRESH = 1u << 3,
+  POSEF_OF_FRESH   = 1u << 4,
+  POSEF_RF_FRESH   = 1u << 5,
+  POSEF_SYS_FRESH  = 1u << 6,
+  POSEF_ALT_VALID  = 1u << 7
+};
+
+static AltSrc         alt_src              = ALT_SRC_NONE;
+static RangefinderSrc rf_src               = RF_SRC_NONE;
+static OpticalFlowSrc of_src               = OF_SRC_NONE;
+static bool           mapping_enabled      = true;
+static bool           allow_disarmed_logging = false;
 
 // Takeoff command latch
 static bool     takeoff_sent = false;
@@ -519,6 +565,19 @@ static void append_reason(char* buf, size_t buf_sz, const char* token) {
   }
 }
 
+static bool flight_log_state(State s) {
+  return s == ST_ARMING ||
+         s == ST_TAKEOFF ||
+         s == ST_LIFTOFF_ASSIST ||
+         s == ST_HOVER ||
+         s == ST_LANDING ||
+         s == ST_DISARMING;
+}
+
+static bool flight_log_active(void) {
+  return want_arm || fc_armed || flight_log_state(st);
+}
+
 static bool lpos_fresh(uint64_t t) {
   return have_lpos && (t - lpos_last_update_ms) < SENSOR_FRESH_MS;
 }
@@ -561,6 +620,19 @@ static float hover_target_z_down_for_phase(HoverPhase phase) {
 
 static float hover_target_z_down(void) {
   return hover_target_z_down_for_phase(current_hover_phase());
+}
+
+static float logged_z_target_down(void) {
+  if (!fc_armed || ceiling_active) return NAN;
+  if (st == ST_HOVER) return hover_target_z_down();
+  return NAN;
+}
+
+static float logged_cmd_vz_ned(void) {
+  if (!fc_armed) return NAN;
+  if (ceiling_active) return CEILING_DESCENT_BASE_MPS;
+  if (st == ST_LANDING) return 0.15f;
+  return NAN;
 }
 
 static void log_bootstrap_event(uint64_t t, const char* event, const char* reason) {
@@ -847,6 +919,58 @@ static void send_vel_frame(float vx, float vy, float vz, float yaw_rate_deg_s, u
   mav_send(&m);
 }
 
+// Ceiling hold: XY position hold (if locked) + Z velocity + yaw hold.
+// Used during ceiling descent so the drone doesn't drift in XY.
+static void send_ceiling_hold(float vz_down) {
+  if (!have_fc) return;
+
+  float yaw = have_yaw_target ? yaw_target_deg :
+              (!isnan(hover_hold_yaw_deg) ? hover_hold_yaw_deg : 0.0f);
+
+  static uint64_t last_log = 0;
+  uint64_t t = now_ms();
+  if (t - last_log > 2000) {
+    last_log = t;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "CMD_CEIL xy_lock=%d vz=%.2f yaw=%.1f",
+             hover_xy_locked, vz_down, yaw);
+    if(log_fp) { fprintf(log_fp, "# %s\n", buf); }
+    if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
+  }
+
+  uint16_t mask;
+  float px = 0.0f, py = 0.0f;
+
+  if (hover_xy_locked) {
+    // Hold locked XY position, command Z velocity, hold yaw
+    px = hover_lock_x_m;
+    py = hover_lock_y_m;
+    mask = (1<<2)              // ignore z position (use vz instead)
+         | (1<<3)|(1<<4)      // ignore vx,vy (position controller handles XY)
+         | (1<<6)|(1<<7)|(1<<8) // ignore accel
+         | (1<<11);           // ignore yaw_rate
+  } else {
+    // No XY lock — command zero XY velocity, Z velocity, hold yaw
+    mask = (1<<0)|(1<<1)|(1<<2) // ignore position
+         | (1<<6)|(1<<7)|(1<<8) // ignore accel
+         | (1<<11);             // ignore yaw_rate
+  }
+
+  mavlink_message_t m;
+  mavlink_msg_set_position_target_local_ned_pack(
+      g_sysid, g_compid, &m,
+      (uint32_t)now_ms(),
+      fc_sysid, fc_compid,
+      MAV_FRAME_LOCAL_NED,
+      mask,
+      px, py, 0.0f,
+      0.0f, 0.0f, vz_down,
+      0,0,0,
+      deg2rad(yaw), 0
+  );
+  mav_send(&m);
+}
+
 // Position+Yaw hold command in LOCAL_NED
 static void send_pos_yaw_ned(float x, float y, float z_down, float yaw_deg) {
   if (!have_fc) return;
@@ -1075,6 +1199,138 @@ static bool of_fresh(uint64_t t) {
   return have_of && (t - of_last_update_ms) < SENSOR_FRESH_MS;
 }
 
+static bool fc_link_fresh(uint64_t t) {
+  return have_fc && last_hb_ms != 0 && (t - last_hb_ms) < HEARTBEAT_TIMEOUT_MS;
+}
+
+static bool att_fresh(uint64_t t) {
+  return have_att && att_last_update_ms != 0 && (t - att_last_update_ms) < SENSOR_FRESH_MS;
+}
+
+// ----------------------------- Pose ring helpers -----------------------
+static float lerp_float(float a, float b, float u) {
+  return a + (b - a) * u;
+}
+
+static float lerp_angle_deg(float a, float b, float u) {
+  float delta = b - a;
+  while (delta >= 180.0f)  delta -= 360.0f;
+  while (delta < -180.0f)  delta += 360.0f;
+  float r = a + delta * u;
+  while (r >= 180.0f)  r -= 360.0f;
+  while (r < -180.0f)  r += 360.0f;
+  return r;
+}
+
+static uint16_t sat_u16_age(uint64_t ref_ms, uint64_t update_ms) {
+  if (update_ms == 0 || ref_ms <= update_ms) return 0;
+  uint64_t age = ref_ms - update_ms;
+  if (age > 0xFFFFu) age = 0xFFFFu;
+  return (uint16_t)age;
+}
+
+static uint16_t pose_flags_for_time(uint64_t t) {
+  uint16_t flags = 0;
+  if (fc_link_fresh(t))  flags |= POSEF_FC_LINK;
+  if (fc_armed)          flags |= POSEF_FC_ARMED;
+  if (att_fresh(t))      flags |= POSEF_ATT_FRESH;
+  if (lpos_fresh(t))     flags |= POSEF_LPOS_FRESH;
+  if (of_fresh(t))       flags |= POSEF_OF_FRESH;
+  if (rf_fresh(t))       flags |= POSEF_RF_FRESH;
+  if (sys_fresh(t))      flags |= POSEF_SYS_FRESH;
+  if (isfinite(alt_est_m)) flags |= POSEF_ALT_VALID;
+  return flags;
+}
+
+static bool pose_valid_for_mapping(uint64_t t) {
+  if (!fc_link_fresh(t)) return false;
+  if (!att_fresh(t))     return false;
+  if (!lpos_fresh(t))    return false;
+  if (!isfinite(lpos_x_m) || !isfinite(lpos_y_m)) return false;
+  if (!isfinite(alt_est_m)) return false;
+  return true;
+}
+
+static bool mapping_gate(uint64_t t) {
+  if (!mapping_enabled) return false;
+  if (!allow_disarmed_logging && !fc_armed) return false;
+  return pose_valid_for_mapping(t);
+}
+
+static void pose_ring_push(uint64_t t) {
+  pose_sample_t* s = &pose_ring[pose_ring_head];
+
+  s->host_ms        = t;
+  s->x_m            = lpos_x_m;
+  s->y_m            = lpos_y_m;
+  s->vx_mps         = lpos_vx_mps;
+  s->vy_mps         = lpos_vy_mps;
+  s->vz_mps         = lpos_vz_mps;
+  s->alt_m          = alt_est_m;
+  s->lpos_alt_m     = lpos_alt_m;
+  s->lpos_alt_filt_m = lpos_alt_filt_m;
+  s->yaw_deg        = have_att ? current_heading_deg() : NAN;
+  s->roll_rad       = have_att ? roll_rad : NAN;
+  s->pitch_rad      = have_att ? pitch_rad : NAN;
+  s->alt_src        = (uint8_t)alt_src;
+  s->valid_xy       = pose_valid_for_mapping(t) ? 1u : 0u;
+  s->valid_att      = att_fresh(t) ? 1u : 0u;
+
+  pose_ring_head = (pose_ring_head + 1) % POSE_RING_SZ;
+  if (pose_ring_count < POSE_RING_SZ) pose_ring_count++;
+}
+
+static bool pose_ring_sample_at(uint64_t target_ms, pose_sample_t* out) {
+  if (!out || pose_ring_count == 0) return false;
+
+  const pose_sample_t* before  = NULL;
+  const pose_sample_t* after   = NULL;
+  const pose_sample_t* nearest = NULL;
+  uint64_t nearest_dt = UINT64_MAX;
+
+  for (int i = 0; i < pose_ring_count; i++) {
+    int idx = (pose_ring_head - pose_ring_count + i + POSE_RING_SZ) % POSE_RING_SZ;
+    const pose_sample_t* s = &pose_ring[idx];
+    if (s->host_ms == 0) continue;
+
+    uint64_t dt = (s->host_ms > target_ms) ? (s->host_ms - target_ms)
+                                            : (target_ms  - s->host_ms);
+    if (dt < nearest_dt) { nearest_dt = dt; nearest = s; }
+    if (s->host_ms <= target_ms)  before = s;
+    if (!after && s->host_ms >= target_ms) after = s;
+  }
+
+  if (!before && !after && !nearest) return false;
+  if (!before || !after || before == after ||
+      after->host_ms == before->host_ms) {
+    *out = nearest ? *nearest : (before ? *before : *after);
+    return true;
+  }
+
+  float u = (float)(target_ms - before->host_ms) /
+            (float)(after->host_ms - before->host_ms);
+  if (u < 0.0f) u = 0.0f;
+  if (u > 1.0f) u = 1.0f;
+
+  memset(out, 0, sizeof(*out));
+  out->host_ms          = target_ms;
+  out->x_m              = lerp_float(before->x_m,              after->x_m,              u);
+  out->y_m              = lerp_float(before->y_m,              after->y_m,              u);
+  out->vx_mps           = lerp_float(before->vx_mps,           after->vx_mps,           u);
+  out->vy_mps           = lerp_float(before->vy_mps,           after->vy_mps,           u);
+  out->vz_mps           = lerp_float(before->vz_mps,           after->vz_mps,           u);
+  out->alt_m            = lerp_float(before->alt_m,            after->alt_m,            u);
+  out->lpos_alt_m       = lerp_float(before->lpos_alt_m,       after->lpos_alt_m,       u);
+  out->lpos_alt_filt_m  = lerp_float(before->lpos_alt_filt_m,  after->lpos_alt_filt_m,  u);
+  out->yaw_deg          = lerp_angle_deg(before->yaw_deg,      after->yaw_deg,          u);
+  out->roll_rad         = lerp_float(before->roll_rad,         after->roll_rad,         u);
+  out->pitch_rad        = lerp_float(before->pitch_rad,        after->pitch_rad,        u);
+  out->alt_src          = (u < 0.5f) ? before->alt_src : after->alt_src;
+  out->valid_xy         = before->valid_xy && after->valid_xy;
+  out->valid_att        = before->valid_att && after->valid_att;
+  return true;
+}
+
 static bool batt_vpc_valid(float vpc) {
   return !isnan(vpc) && vpc >= 1.0f && vpc <= 6.0f;
 }
@@ -1253,6 +1509,11 @@ static void hover_hold_tick(uint64_t t) {
 
   if (hover_xy_locked) {
     send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, z_down, yaw);
+  } else if (lpos_ok) {
+    // During pre-lock hover, keep refreshing the XY target to the current
+    // local position. This prevents ArduPilot from continuing to chase a stale
+    // NAV_TAKEOFF lateral target while we wait for a stable XY lock.
+    send_pos_yaw_ned(lpos_x_m, lpos_y_m, z_down, yaw);
   } else {
     send_z_yaw_ned(z_down, yaw);
   }
@@ -1459,10 +1720,11 @@ static void handle_battery_status(const mavlink_message_t *msg) {
 static void handle_attitude(const mavlink_message_t *msg) {
   mavlink_attitude_t a;
   mavlink_msg_attitude_decode(msg, &a);
-  roll_rad = a.roll;
+  roll_rad  = a.roll;
   pitch_rad = a.pitch;
-  yaw_rad = a.yaw;
-  have_att = true;
+  yaw_rad   = a.yaw;
+  att_last_update_ms = now_ms();
+  have_att  = true;
 }
 
 static void handle_optical_flow(const mavlink_message_t *msg) {
@@ -1470,6 +1732,7 @@ static void handle_optical_flow(const mavlink_message_t *msg) {
   mavlink_msg_optical_flow_decode(msg, &o);
 
   have_of      = true;
+  of_src       = OF_SRC_OPTICAL_FLOW;
   of_quality   = o.quality;
   of_comp_m_x  = o.flow_comp_m_x;
   of_comp_m_y  = o.flow_comp_m_y;
@@ -1485,6 +1748,7 @@ static void handle_optical_flow_rad(const mavlink_message_t *msg) {
   mavlink_msg_optical_flow_rad_decode(msg, &o);
 
   have_of    = true;
+  of_src     = OF_SRC_OPTICAL_FLOW_RAD;
   of_quality = o.quality;
   of_last_update_ms = now_ms();
 
@@ -1552,6 +1816,7 @@ static void handle_distance_sensor(const mavlink_message_t *msg) {
       rangefinder_m = (float)d.current_distance * 0.01f;
       rangefinder_last_update_ms = ds_last_update_ms;
       have_rangefinder = true;
+      rf_src = RF_SRC_DISTANCE_SENSOR;
     }
   }
 }
@@ -1581,6 +1846,7 @@ static void handle_rangefinder_msg(const mavlink_message_t *msg) {
     rangefinder_v = volt;
     rangefinder_last_update_ms = now_ms();
     have_rangefinder = true;
+    rf_src = RF_SRC_RANGEFINDER;
   }
 }
 
@@ -1895,6 +2161,7 @@ static void update_alt_estimate(void) {
   // Pick best altitude estimate for control logic (RF preferred if sane)
   float  new_alt = NAN;
   AltSrc new_src = ALT_SRC_NONE;
+  alt_rf_rejected = false;
 
   if (range_fresh && !isnan(rangefinder_m)) {
     float rf = rangefinder_m;
@@ -1913,6 +2180,8 @@ static void update_alt_estimate(void) {
     if (rf_ok) {
       new_alt = rf;
       new_src = ALT_SRC_RANGEFINDER;
+    } else {
+      alt_rf_rejected = true;
     }
   }
 
@@ -1932,9 +2201,12 @@ static void update_alt_estimate(void) {
   alt_est_m = new_alt;
   alt_src = new_src;
 
-  // Ceiling hysteresis uses alt_max_m to avoid “stuck-low RF hides climb”
-  if (!isnan(alt_max_m) && alt_max_m >= CEIL_M) ceiling_active = true;
-  if (!isnan(alt_max_m) && alt_max_m <= (CEIL_M - 0.10f)) ceiling_active = false;
+  // Ceiling hysteresis uses alt_max_m to avoid “stuck-low RF hides climb”.
+  // Trigger before the hard ceiling so the FC has room to arrest an indoor climb.
+  const float ceiling_trigger_m = CEIL_M - CEIL_MARGIN_M;
+  const float ceiling_release_m = ceiling_trigger_m - 0.10f;
+  if (!isnan(alt_max_m) && alt_max_m >= ceiling_trigger_m) ceiling_active = true;
+  if (!isnan(alt_max_m) && alt_max_m <= ceiling_release_m) ceiling_active = false;
 }
 
 // ----------------------------- Logging ---------------------------------
@@ -1956,8 +2228,10 @@ static void log_init(void) {
     long sz = ftell(log_fp);
     if (sz <= 0) {
       fprintf(log_fp,
-              "t_ms,state,want_arm,armed,mode,yaw_deg,alt_m,alt_src,x_m,y_m,vx_mps,vy_mps,"
-              "rf_m,of_q,of_rate_x,of_rate_y,"
+              "t_ms,state,want_arm,armed,mode,alt_max_m,alt_est_m,alt_src,rf_m,rf_fresh,rf_rejected,"
+              "lpos_alt_m,lpos_alt_filt_m,z_tgt_down_m,cmd_vz_ned_mps,ceiling_active,"
+              "takeoff_sent,takeoff_started,off_ground,hover_xy_locked,"
+              "x_m,y_m,vx_mps,vy_mps,yaw_deg,of_q,of_rate_x,of_rate_y,"
               "tof_f,tof_r,tof_b,tof_l,batt_v,batt_cells\n");
       fflush(log_fp);
     }
@@ -1970,7 +2244,7 @@ static void log_init(void) {
     fseek(scan_fp, 0, SEEK_END);
     long sz = ftell(scan_fp);
     if (sz <= 0) {
-      const char hdr[] = "SCLOG2\n";
+      const char hdr[] = "SCLOG3\n";
       fwrite(hdr, 1, sizeof(hdr)-1, scan_fp);
       fflush(scan_fp);
     }
@@ -1980,13 +2254,53 @@ static void log_init(void) {
   if (!txt_log_fp) {
     fprintf(stderr, "WARN: cannot open %s: %s\n", LOG_TXT_PATH, strerror(errno));
   } else {
-    // Write a session start marker
-    fprintf(txt_log_fp, "\n--- SESSION START ---\n");
+    // Write a session start banner with wall-clock time so battery-swap
+    // boundaries are obvious when reviewing the log.
+    char timebuf[32] = "unknown";
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    if (tm_info) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+    fprintf(txt_log_fp,
+            "\n"
+            "================================================================\n"
+            "  SESSION START  %s\n"
+            "================================================================\n",
+            timebuf);
     fflush(txt_log_fp);
+    session_start_ms = now_ms();
   }
 
   last_flush_ms = now_ms();
   last_log_ms   = 0;
+}
+
+static void log_close(const char* reason) {
+  if (txt_log_fp) {
+    char timebuf[32] = "unknown";
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    if (tm_info) strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+    uint64_t elapsed_ms = now_ms() - session_start_ms;
+    unsigned int elapsed_s  = (unsigned int)(elapsed_ms / 1000);
+    unsigned int elapsed_m  = elapsed_s / 60;
+    elapsed_s %= 60;
+    fprintf(txt_log_fp,
+            "\n"
+            "================================================================\n"
+            "  SESSION END    %s  (%s)  duration=%um%02us\n"
+            "================================================================\n\n",
+            timebuf, reason ? reason : "unknown", elapsed_m, elapsed_s);
+    fflush(txt_log_fp);
+    fclose(txt_log_fp);
+    txt_log_fp = NULL;
+  }
+  if (log_fp)  { fclose(log_fp);  log_fp  = NULL; }
+  if (scan_fp) { fclose(scan_fp); scan_fp = NULL; }
+}
+
+static void sig_handler(int sig) {
+  (void)sig;
+  g_shutdown = 1;
 }
 
 static void log_flush_if_due(uint64_t t) {
@@ -1998,71 +2312,174 @@ static void log_flush_if_due(uint64_t t) {
 }
 
 typedef struct __attribute__((packed)) {
-  uint32_t magic;       // 'SCN2'
-  uint32_t host_ms;
+  uint32_t magic;        // 'SCN3'
+  uint64_t host_ms;
   uint32_t scan_ms;
+  uint32_t custom_mode;
 
   float    x_m;
   float    y_m;
   float    yaw_deg;
   float    alt_m;
+  float    alt_max_m;
 
   float    roll_rad;
   float    pitch_rad;
 
+  float    vx_mps;
+  float    vy_mps;
+  float    vz_mps;
+
+  float    lpos_alt_m;
+  float    lpos_alt_filt_m;
   float    rf_m;
+  float    rf_v;
   float    of_rate_x;
   float    of_rate_y;
-  uint8_t  of_q;
+  float    of_comp_m_x;
+  float    of_comp_m_y;
+  float    of_ground_m;
 
-  uint8_t  state;
-  uint8_t  kf_flags;
-  uint16_t _pad0;
-
+  uint32_t sys_present;
   uint32_t sys_health;
+  uint32_t sys_enabled;
+
+  uint16_t att_age_ms;
+  uint16_t lpos_age_ms;
+  uint16_t of_age_ms;
+  uint16_t rf_age_ms;
+  uint16_t hb_age_ms;
+  uint16_t pose_flags;
+
+  uint8_t  of_q;
+  uint8_t  alt_src;
+  uint8_t  rf_src;
+  uint8_t  of_src;
+  uint8_t  fc_armed;
+  uint8_t  alt_rf_rejected;
+  uint8_t  ds_orientation;
+  uint8_t  ds_id;
+  uint16_t ds_cur_cm;
 
   uint8_t  grid_raw[512];
 } scanrec_t;
 
 static void log_scan_record(void) {
-  if (!scan_fp || !have_scan_frame) return;
+  if (!scan_new) return;
+
+  uint64_t now = now_ms();
+  uint64_t sample_ms = last_scan_host_ms;
+  if (sample_ms == 0) {
+    scan_new = false;
+    return;
+  }
+
+  if (!scan_fp) {
+    scan_new = false;
+    return;
+  }
+
+  if (!mapping_enabled || (!allow_disarmed_logging && !fc_armed)) {
+    scan_new = false;
+    return;
+  }
+
+  if (!pose_valid_for_mapping(sample_ms)) {
+    if ((now - last_scan_host_ms) > SCAN_PENDING_MAX_MS) {
+      static uint64_t last_drop_log_ms = 0;
+      if ((now - last_drop_log_ms) > 1000) {
+        last_drop_log_ms = now;
+        printf("Dropping scan: pose invalid at scan time (alt_src=%s flags=0x%02x)\n",
+               alt_src_name(alt_src),
+               (unsigned)pose_flags_for_time(sample_ms));
+      }
+      scan_new = false;
+    }
+    return;
+  }
+
+  pose_sample_t pose;
+  if (!pose_ring_sample_at(sample_ms, &pose)) {
+    memset(&pose, 0, sizeof(pose));
+    pose.host_ms       = sample_ms;
+    pose.x_m           = lpos_x_m;
+    pose.y_m           = lpos_y_m;
+    pose.vx_mps        = lpos_vx_mps;
+    pose.vy_mps        = lpos_vy_mps;
+    pose.vz_mps        = lpos_vz_mps;
+    pose.alt_m         = alt_est_m;
+    pose.lpos_alt_m    = lpos_alt_m;
+    pose.lpos_alt_filt_m = lpos_alt_filt_m;
+    pose.yaw_deg       = current_heading_deg();
+    pose.roll_rad      = roll_rad;
+    pose.pitch_rad     = pitch_rad;
+    pose.alt_src       = (uint8_t)alt_src;
+    pose.valid_xy      = 1u;
+    pose.valid_att     = 1u;
+  }
 
   scanrec_t r;
   memset(&r, 0, sizeof(r));
+  r.magic       = 0x334E4353u; // 'SCN3'
+  r.host_ms     = last_scan_host_ms;
+  r.scan_ms     = last_scan_t_ms;
+  r.custom_mode = hb_custom_mode;
 
-  r.magic   = 0x324E4353u; // 'SCN2'
-  r.host_ms = (uint32_t)last_scan_host_ms;
-  r.scan_ms = last_scan_t_ms;
+  r.x_m              = pose.x_m;
+  r.y_m              = pose.y_m;
+  r.yaw_deg          = pose.yaw_deg;
+  r.alt_m            = pose.alt_m;
+  r.alt_max_m        = alt_max_m;
 
-  r.x_m   = have_xy ? lpos_x_m : NAN;
-  r.y_m   = have_xy ? lpos_y_m : NAN;
-  r.yaw_deg = have_att ? current_heading_deg() : NAN;
-  r.alt_m = alt_est_m;
+  r.roll_rad         = pose.roll_rad;
+  r.pitch_rad        = pose.pitch_rad;
+  r.vx_mps           = pose.vx_mps;
+  r.vy_mps           = pose.vy_mps;
+  r.vz_mps           = pose.vz_mps;
+  r.lpos_alt_m       = pose.lpos_alt_m;
+  r.lpos_alt_filt_m  = pose.lpos_alt_filt_m;
 
-  r.roll_rad = have_att ? roll_rad : NAN;
-  r.pitch_rad = have_att ? pitch_rad : NAN;
+  r.rf_m             = rf_fresh(sample_ms) ? rangefinder_m : NAN;
+  r.rf_v             = rangefinder_v;
+  r.of_rate_x        = of_rate_x;
+  r.of_rate_y        = of_rate_y;
+  r.of_comp_m_x      = of_comp_m_x;
+  r.of_comp_m_y      = of_comp_m_y;
+  r.of_ground_m      = of_ground_m;
 
-  r.rf_m  = rangefinder_m;
-  r.of_rate_x = of_rate_x;
-  r.of_rate_y = of_rate_y;
-  r.of_q = of_quality;
-  r.state = (uint8_t)st;
+  r.sys_present      = have_sys ? sys_present : 0;
+  r.sys_health       = have_sys ? sys_health  : 0;
+  r.sys_enabled      = have_sys ? sys_enabled : 0;
 
-  r.kf_flags = pending_kf_flags;
-  pending_kf_flags = 0;
+  r.att_age_ms       = sat_u16_age(sample_ms, att_last_update_ms);
+  r.lpos_age_ms      = sat_u16_age(sample_ms, lpos_last_update_ms);
+  r.of_age_ms        = sat_u16_age(sample_ms, of_last_update_ms);
+  r.rf_age_ms        = sat_u16_age(sample_ms, rangefinder_last_update_ms);
+  r.hb_age_ms        = sat_u16_age(sample_ms, last_hb_ms);
+  r.pose_flags       = pose_flags_for_time(sample_ms);
 
-  r.sys_health = have_sys ? sys_health : 0;
+  r.of_q             = of_fresh(sample_ms) ? of_quality : 0;
+  r.alt_src          = pose.alt_src;
+  r.rf_src           = (uint8_t)rf_src;
+  r.of_src           = (uint8_t)of_src;
+  r.fc_armed         = fc_armed ? 1u : 0u;
+  r.alt_rf_rejected  = alt_rf_rejected ? 1u : 0u;
+  r.ds_orientation   = ds_orientation;
+  r.ds_id            = ds_id;
+  r.ds_cur_cm        = ds_cur_cm;
 
   memcpy(r.grid_raw, last_scan_grid_raw, sizeof(r.grid_raw));
-
   fwrite(&r, 1, sizeof(r), scan_fp);
+  scan_new = false;
 }
 
 static void log_tick(uint64_t t) {
   const uint64_t period_ms = 1000 / LOG_HZ;
 
-  if (log_fp && (t - last_log_ms) >= period_ms) {
+  if (log_fp && flight_log_active() && (t - last_log_ms) >= period_ms) {
     last_log_ms = t;
+    bool rf_now_fresh = rf_fresh(t);
+    bool off_ground = takeoff_off_ground(t);
 
     fprintf(log_fp,
             "%llu,%s,%d,%d,%u,",
@@ -2072,19 +2489,35 @@ static void log_tick(uint64_t t) {
             fc_armed ? 1 : 0,
             (unsigned)hb_custom_mode);
 
-    if (have_att) fprintf(log_fp, "%.3f,", current_heading_deg());
+    if (!isnan(alt_max_m)) fprintf(log_fp, "%.3f,", alt_max_m);
     else fprintf(log_fp, "nan,");
-
     if (!isnan(alt_est_m)) fprintf(log_fp, "%.3f,", alt_est_m);
     else fprintf(log_fp, "nan,");
     fprintf(log_fp, "%s,", alt_src_name(alt_src));
+
+    if (have_rangefinder) fprintf(log_fp, "%.3f,", rangefinder_m);
+    else fprintf(log_fp, "nan,");
+    fprintf(log_fp, "%d,%d,", rf_now_fresh ? 1 : 0, alt_rf_rejected ? 1 : 0);
+
+    if (have_lpos) fprintf(log_fp, "%.3f,%.3f,", lpos_alt_m, lpos_alt_filt_m);
+    else fprintf(log_fp, "nan,nan,");
+
+    if (!isnan(logged_z_target_down())) fprintf(log_fp, "%.3f,", logged_z_target_down());
+    else fprintf(log_fp, "nan,");
+    if (!isnan(logged_cmd_vz_ned())) fprintf(log_fp, "%.3f,", logged_cmd_vz_ned());
+    else fprintf(log_fp, "nan,");
+    fprintf(log_fp, "%d,%d,%d,%d,%d,",
+            ceiling_active ? 1 : 0,
+            takeoff_sent ? 1 : 0,
+            takeoff_started ? 1 : 0,
+            off_ground ? 1 : 0,
+            hover_xy_locked ? 1 : 0);
 
     if (have_xy) fprintf(log_fp, "%.3f,%.3f,%.3f,%.3f,",
                          lpos_x_m, lpos_y_m, lpos_vx_mps, lpos_vy_mps);
     else fprintf(log_fp, "nan,nan,nan,nan,");
 
-    bool rf_fresh = have_rangefinder && (t - rangefinder_last_update_ms) < 400;
-    if (rf_fresh && !isnan(rangefinder_m)) fprintf(log_fp, "%.3f,", rangefinder_m);
+    if (have_att) fprintf(log_fp, "%.3f,", current_heading_deg());
     else fprintf(log_fp, "nan,");
 
     bool of_ok = of_fresh(t);
@@ -2101,10 +2534,7 @@ static void log_tick(uint64_t t) {
     else fprintf(log_fp, "nan,0\n");
   }
 
-  if (scan_new) {
-    scan_new = false;
-    log_scan_record();
-  }
+  log_scan_record();
 
   log_flush_if_due(t);
 }
@@ -2136,6 +2566,7 @@ static void enter_state(State ns, const char* reason) {
 
     takeoff_started = false;
     takeoff_started_ms = 0;
+    takeoff_off_ground_since_ms = 0;
     takeoff_att_ramp_active = false;
     takeoff_att_ramp_start_ms = 0;
     takeoff_alt0_m = alt_max_m;
@@ -2171,7 +2602,7 @@ static void enter_state(State ns, const char* reason) {
 
   printf("STATE: %s -> %s reason=%s\n", state_name(st), state_name(ns), reason ? reason : "unknown");
   if (txt_log_fp) {
-    fprintf(txt_log_fp, "[%.3f] STATE: %s -> %s reason=%s\n", now_ms()*0.001f, 
+    fprintf(txt_log_fp, "\n[%.3f] >>> STATE: %s -> %s  reason=%s <<<\n\n", now_ms()*0.001f,
             state_name(st), state_name(ns), reason ? reason : "unknown");
   }
 
@@ -2335,15 +2766,40 @@ static void battery_failsafe_tick(uint64_t t) {
 // ----------------------------- Takeoff helpers -------------------------
 static bool takeoff_off_ground(uint64_t t) {
   bool rf_fresh = have_rangefinder && (t - rangefinder_last_update_ms) < 400;
-  bool landed_air = have_ext && landed_state != MAV_LANDED_STATE_ON_GROUND;
+  bool landed_air = have_ext && landed_state == MAV_LANDED_STATE_IN_AIR;
 
   bool rf_ok = rf_fresh && !isnan(rangefinder_m) && rangefinder_m > 0.08f;
   bool alt_ok = !isnan(alt_max_m) && alt_max_m > 0.08f;
   bool rise_ok = (!isnan(takeoff_alt0_m) && !isnan(alt_max_m) && (alt_max_m - takeoff_alt0_m) > 0.05f);
 
-  if (rf_ok || alt_ok || rise_ok) return true;
-  if (landed_air && (rf_ok || alt_ok)) return true; // require some altitude evidence even if FC says IN_AIR
-  return false;
+  // EKF landed state can flip to IN_AIR while the vehicle is still skimming
+  // the ground. Require some actual altitude evidence before treating takeoff
+  // as complete, otherwise we can hand off into HOVER at a few centimeters.
+  return rf_ok || alt_ok || rise_ok || (landed_air && (rf_ok || alt_ok || rise_ok));
+}
+
+static bool takeoff_attitude_stable(void) {
+  if (!have_att) return false;
+  return fabsf(rad2deg(roll_rad)) <= TAKEOFF_HANDOFF_MAX_TILT_DEG &&
+         fabsf(rad2deg(pitch_rad)) <= TAKEOFF_HANDOFF_MAX_TILT_DEG;
+}
+
+static bool takeoff_hover_handoff_ready(uint64_t t, bool off_ground) {
+  if (!off_ground) {
+    takeoff_off_ground_since_ms = 0;
+    return false;
+  }
+
+  if (takeoff_off_ground_since_ms == 0) {
+    takeoff_off_ground_since_ms = t;
+    return false;
+  }
+
+  if ((t - takeoff_off_ground_since_ms) < TAKEOFF_HANDOFF_OFFGROUND_MS) return false;
+  // Do not enter hover-hold while still in extreme ground effect. The hold
+  // logic assumes we are clearly airborne before it starts clamping altitude.
+  if (isnan(alt_max_m) || alt_max_m < HOVER_CAPTURE_MIN_ALT_M) return false;
+  return takeoff_attitude_stable();
 }
 
 static void snap_add(uint64_t t) {
@@ -2475,6 +2931,7 @@ static void log_snapshot_tick(uint64_t t) {
   print_snap_line(stdout, s);
   if (txt_log_fp) {
     print_snap_line(txt_log_fp, s);
+    fflush(txt_log_fp);
   }
 }
 
@@ -2493,7 +2950,7 @@ static void snap_dump(void) {
     idx = (idx + 1) % SNAP_RING_SZ;
   }
   printf("--- END PRE-FAIL DUMP ---\n\n");
-  if (txt_log_fp) fprintf(txt_log_fp, "--- END ---\n");
+  if (txt_log_fp) fprintf(txt_log_fp, "--- END PRE-FAIL DUMP ---\n");
   fflush(stdout);
   if (txt_log_fp) fflush(txt_log_fp);
 }
@@ -2506,6 +2963,7 @@ static void control_tick(void) {
 
   update_alt_estimate();
   tof_filter_tick();
+  pose_ring_push(t);
   log_tick(t);
 
   battery_failsafe_tick(t);
@@ -2521,7 +2979,7 @@ static void control_tick(void) {
 
   if (!have_fc) {
     if (st != ST_WAIT_LINK) enter_state(ST_WAIT_LINK, "No FC Link");
-    return;
+    goto control_tick_done;
   }
 
   if (!rcmap_known && (t - rcmap_last_request_ms) > 2000) {
@@ -2532,7 +2990,7 @@ static void control_tick(void) {
     printf("NO-GO: SYS_STATUS indicates gyro or motor outputs unhealthy.\n");
     if (fc_armed) enter_state(ST_DISARMING, "Health Fail");
     else enter_state(ST_IDLE, "Health Fail");
-    return;
+    goto control_tick_done;
   }
 
   // Unexpected disarm
@@ -2556,11 +3014,19 @@ static void control_tick(void) {
 
   if (!fc_armed_prev && fc_armed) {
     start_bootstrap_grace(t, "fc_armed");
+    if (txt_log_fp) {
+      fprintf(txt_log_fp, "\n--- ARMED   t=%llums ---\n\n", (unsigned long long)t);
+      fflush(txt_log_fp);
+    }
   }
   if (fc_armed_prev && !fc_armed) {
     bootstrap_grace_until_ms = 0;
     bootstrap_grace_was_active = false;
     hover_health_fail_since_ms = 0;
+    if (txt_log_fp) {
+      fprintf(txt_log_fp, "\n--- DISARMED t=%llums ---\n\n", (unsigned long long)t);
+      fflush(txt_log_fp);
+    }
   }
   fc_armed_prev = fc_armed;
 
@@ -2572,20 +3038,43 @@ static void control_tick(void) {
     last_disarm_cmd_ms = 0;
     disarm_fc_force();
     enter_state(ST_DISARMING, "User Abort");
-    return;
+    goto control_tick_done;
   }
 
-  // Ceiling safety: always clamp down. Use Z-only until XY has been explicitly locked.
+  // Pre-ceiling braking: decelerate climbs before the ceiling descent mode takes over.
+  if (fc_armed && !ceiling_active && !isnan(alt_max_m) && !isnan(lpos_vz_mps)
+      && alt_max_m > (CEIL_M - CEIL_MARGIN_M - 0.05f) && lpos_vz_mps < -0.15f) {
+    float brake_vz = (-lpos_vz_mps) * 0.9f;   // counter most of the climb rate before the hard limit
+    if (brake_vz < 0.20f) brake_vz = 0.20f;
+    if (brake_vz > 2.0f)  brake_vz = 2.0f;
+    send_ceiling_hold(brake_vz);
+    goto control_tick_done;
+  }
+
+  // Ceiling safety: proportional descent with velocity compensation.
+  // Tapers descent speed near the release threshold to avoid building up
+  // downward momentum that the hover controller cannot arrest.
   if (ceiling_active && fc_armed) {
-    if (!have_yaw_target && have_att) {
-      have_yaw_target = true;
-      yaw_target_deg = current_heading_deg();
+    const float ceiling_trigger_m = CEIL_M - CEIL_MARGIN_M;
+    const float ceiling_release_m = ceiling_trigger_m - 0.10f;
+    float overshoot = (!isnan(alt_max_m)) ? (alt_max_m - CEIL_M) : 0.0f;
+    if (overshoot < 0.0f) overshoot = 0.0f;
+    float vz_cmd = CEILING_DESCENT_BASE_MPS + overshoot * 4.0f;
+    // Counteract upward velocity (negative lpos_vz = climbing in NED)
+    float cur_vz = isnan(lpos_vz_mps) ? 0.0f : lpos_vz_mps;
+    if (cur_vz < 0.0f)
+      vz_cmd += (-cur_vz);
+    // Taper descent as we approach the release altitude so hover can take over smoothly
+    if (!isnan(alt_max_m) && alt_max_m < ceiling_trigger_m) {
+      float frac = (alt_max_m - ceiling_release_m) / (ceiling_trigger_m - ceiling_release_m);
+      if (frac < 0.1f) frac = 0.1f;
+      if (frac > 1.0f) frac = 1.0f;
+      vz_cmd *= frac;
     }
-    float yaw = have_yaw_target ? yaw_target_deg : (have_att ? current_heading_deg() : 0.0f);
-    float safe_z = hover_target_z_down();
-    if (hover_xy_locked) send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, safe_z, yaw);
-    else send_z_yaw_ned(safe_z, yaw);
-    return;
+    if (vz_cmd < 0.10f) vz_cmd = 0.10f;
+    if (vz_cmd > CEILING_DESCENT_MAX_MPS) vz_cmd = CEILING_DESCENT_MAX_MPS;
+    send_ceiling_hold(vz_cmd);
+    goto control_tick_done;
   }
 
   if (fc_armed && (st == ST_TAKEOFF || st == ST_HOVER)) {
@@ -2608,7 +3097,7 @@ static void control_tick(void) {
       if ((t - hover_health_fail_since_ms) >= fail_limit_ms) {
         log_bootstrap_event(t, "LANDING_FAILSAFE", reasons);
         enter_state(ST_LANDING, strict_hover_checks ? "Hover Health Fail" : "Bootstrap Health Fail");
-        return;
+        goto control_tick_done;
       }
     }
   } else {
@@ -2679,6 +3168,7 @@ static void control_tick(void) {
       bool mot_started = servo_fresh && (mot_avg > TAKEOFF_MOT_START_US);
       bool off_ground = takeoff_off_ground(t);
       bool alt_rising = (!isnan(takeoff_alt0_m) && !isnan(alt_max_m) && (alt_max_m - takeoff_alt0_m) > 0.05f);
+      bool handoff_ready = takeoff_hover_handoff_ready(t, off_ground);
 
       // Delay attitude thrust ramp until after NAV_TAKEOFF has time to spool and only if no rise yet.
       if (!takeoff_started && !takeoff_att_ramp_active && takeoff_sent &&
@@ -2686,15 +3176,6 @@ static void control_tick(void) {
           !mot_started && !alt_rising && !off_ground) {
         takeoff_att_ramp_active = true;
         takeoff_att_ramp_start_ms = t;
-      }
-
-      // Stream setpoints once past the no-vel window; allow during ramp so FC has a Z target.
-      bool allow_stream = takeoff_sent && (t - takeoff_sent_ms) >= TAKEOFF_NO_VEL_MS;
-      if (allow_stream) {
-        float yaw = have_yaw_target ? yaw_target_deg :
-                    (have_att ? current_heading_deg() : 0.0f);
-        float z_down = hover_target_z_down();
-        send_z_yaw_ned(z_down, yaw);
       }
 
       // Run the attitude thrust ramp while waiting for lift
@@ -2752,6 +3233,18 @@ static void control_tick(void) {
           yaw_target_deg = current_heading_deg();
         }
         enter_state(ST_HOVER, "Target Height Reached");
+        break;
+      }
+
+      if (handoff_ready) {
+        if (!have_yaw_target && have_att) {
+          have_yaw_target = true;
+          yaw_target_deg = current_heading_deg();
+        }
+        printf("TAKEOFF: handoff to HOVER on sustained off-ground confirmation (altMAX=%.2f altEST=%.2f landed=%u(%s))\n",
+               alt_max_m, alt_est_m,
+               (unsigned)landed_state, landed_state_name(landed_state));
+        enter_state(ST_HOVER, "Off Ground Confirmed");
       }
     } break;
 
@@ -2806,10 +3299,22 @@ static void control_tick(void) {
       break;
   }
 
-  if (csv_fp) {
-      float alt = isnan(lpos_alt_m) ? 0 : lpos_alt_m;
-      fprintf(csv_fp, "%lu,%s,%.2f,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%ld,%ld,%ld,%ld\n",
-          t, state_name(st), alt,
+control_tick_done:
+  if (csv_fp && flight_log_active()) {
+      bool off_ground = takeoff_off_ground(t);
+      bool rf_now_fresh = rf_fresh(t);
+      fprintf(csv_fp, "%llu,%s,%d,%d,%u,%.3f,%.3f,%s,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%u,%u,%u,%u,%.2f,%.2f,%.2f,%ld,%ld,%ld,%ld\n",
+          (unsigned long long)t, state_name(st),
+          want_arm ? 1 : 0, fc_armed ? 1 : 0, (unsigned)hb_custom_mode,
+          alt_max_m, alt_est_m, alt_src_name(alt_src),
+          rangefinder_m, rf_now_fresh ? 1 : 0, alt_rf_rejected ? 1 : 0,
+          lpos_alt_m, lpos_alt_filt_m,
+          logged_z_target_down(), logged_cmd_vz_ned(),
+          ceiling_active ? 1 : 0,
+          takeoff_sent ? 1 : 0,
+          takeoff_started ? 1 : 0,
+          off_ground ? 1 : 0,
+          hover_xy_locked ? 1 : 0,
           roll_rad * 57.2958f, pitch_rad * 57.2958f, yaw_rad * 57.2958f,
           motor_pwm[0], motor_pwm[1], motor_pwm[2], motor_pwm[3],
           vib_x, vib_y, vib_z,
@@ -2828,11 +3333,18 @@ int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IOLBF, 0);
   setvbuf(stderr, NULL, _IONBF, 0);
 
+  signal(SIGINT,  sig_handler);
+  signal(SIGTERM, sig_handler);
+
   log_init();
 
   csv_fp = fopen("flight_data.csv", "w");
   if (csv_fp) {
-    fprintf(csv_fp, "Time_ms,State,Alt,Roll,Pitch,Yaw,Mot1,Mot2,Mot3,Mot4,VibX,VibY,VibZ,RPM1,RPM2,RPM3,RPM4\n");
+    fprintf(csv_fp,
+            "Time_ms,State,WantArm,Armed,Mode,AltMax_m,AltEst_m,AltSrc,Rangefinder_m,RfFresh,RfRejected,"
+            "LposAlt_m,LposAltFilt_m,ZTgtDown_m,CmdVzNed_mps,CeilingActive,"
+            "TakeoffSent,TakeoffStarted,OffGround,HoverXYLocked,"
+            "Roll_deg,Pitch_deg,Yaw_deg,Mot1,Mot2,Mot3,Mot4,VibX,VibY,VibZ,RPM1,RPM2,RPM3,RPM4\n");
     fflush(csv_fp);
   } else {
     fprintf(stderr, "Failed to open flight_data.csv\n");
@@ -2861,7 +3373,7 @@ int main(int argc, char** argv) {
   if (tof_fd < 0) return 1;
   printf("Opened ToF UART: %s @%d\n", TOF_UART, TOF_BAUD);
 
-  while (1) {
+  while (!g_shutdown) {
     struct pollfd pfd[2];
     pfd[0].fd = fc_fd;  pfd[0].events = POLLIN;
     pfd[1].fd = tof_fd; pfd[1].events = POLLIN;
@@ -2874,5 +3386,6 @@ int main(int argc, char** argv) {
     control_tick();
   }
 
+  log_close("SIGINT/SIGTERM");
   return 0;
 }
