@@ -1,3 +1,29 @@
+//old code. do not use. change to either clean_uav_tof_nav.c or exploration.c (currently in the worsk)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // uav_fc_tof_nav.c  (stability-first “ETH-ish” single-drone behavior)
 //
 // CHANGELOG (critical behavior fixes):
