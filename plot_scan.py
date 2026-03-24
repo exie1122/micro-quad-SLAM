@@ -57,7 +57,7 @@ DEFAULT_SENSOR_OFFSETS_BODY_XY_M = np.array([
 DEFAULT_SENSOR_YAW_TRIMS_DEG = np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 DEFAULT_COLUMN_AZ_OFFSETS_DEG = np.zeros((NUM_SENSORS, COLS), dtype=np.float32)
 OUTLIER_REJECT_RADIUS_M = 0.2 #lower = more aggressive
-OUTLIER_REJECT_MIN_NEIGHBORS = 3 #higher = more aggressive
+OUTLIER_REJECT_MIN_NEIGHBORS = 4 #higher = more aggressive
 MANHATTAN_MIN_SENSOR_POINTS = 4
 MANHATTAN_MIN_CONTRIBUTING_SENSORS = 2
 MANHATTAN_MIN_LINEARITY = 3.0
@@ -844,7 +844,12 @@ def plot_data(
         zorder=1,
     )
     trajectory, = ax.plot([], [], 'r-', linewidth=1, label='Trajectory')
-    drone_marker, = ax.plot([], [], 'ro', markersize=5)
+    drone_marker, = ax.plot([], [], 'ko', markersize=6, zorder=10)
+    heading_arrow = ax.annotate(
+        '', xy=(0, 0), xytext=(0, 0),
+        arrowprops=dict(arrowstyle='->', color='magenta', lw=2.5, mutation_scale=15),
+        zorder=11,
+    )
     
     ax.set_aspect('equal')
     ax.grid(True)
@@ -1017,12 +1022,16 @@ def plot_data(
         )
         trajectory.set_data(traj_disp_x, traj_disp_y)
         
-        # Update Drone Pos
+        # Update Drone Pos + heading arrow
         if view_state['single_frame_only']:
-            drone_marker.set_data([records[frame_idx]['x']], [records[frame_idx]['y']])
+            drec = records[frame_idx]
         else:
-            end_f = int(s_range_end.val)
-            drone_marker.set_data([records[end_f]['x']], [records[end_f]['y']])
+            drec = records[int(s_range_end.val)]
+        dx, dy = drec['x'], drec['y']
+        drone_marker.set_data([dx], [dy])
+        yaw_rad = math.radians(drec['yaw'])
+        heading_arrow.xy = (dx + 0.6 * math.cos(yaw_rad), dy + 0.6 * math.sin(yaw_rad))
+        heading_arrow.set_position((dx, dy))
         if view_state['single_frame_only']:
             mode_label = f"Frame {frame_idx + 1}/{len(records)}"
         else:
