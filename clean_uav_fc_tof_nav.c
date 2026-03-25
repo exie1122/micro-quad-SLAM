@@ -1,3 +1,20 @@
+// uav_fc_local_nav.c  (stability-first “ETH-ish” single-drone behavior)
+//
+// STABILITY/DEMO REVISION:
+// - Hover-only behavior (exploration removed for minimal hover testing)
+// - XY lock now requires a continuous low-vx/low-vy dwell before freezing the hover anchor
+// - Always hold Z using a Z-only LOCAL_NED setpoint until XY has been explicitly locked
+// - Ceiling uses MAX of available altitude sources (RF and LPOS) so a “stuck-low” RF can’t hide a real climb
+// - DISARM: force-disarm immediately when want_arm drops (param2=21196), any state/mode
+// - Line-buffered stdout / unbuffered stderr for reliable logging
+// - Disable per-tick EXT_SYS_STATE spam by default (printing at 50Hz can wreck timing)
+// - The ToF ring is filtered and logged, but is not part of the hover stabilization control loop
+//
+// IMPORTANT NOTE:
+// Companion code can *request* poshold/althold, but if your FC estimator/OF/rangefinder is bad,
+// the FC will drift anyway. This script makes the companion-side behavior as strict as possible
+// (continuous setpoint streaming + gating), and failsafes to LAND if pose/alt is unhealthy.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -25,6 +42,10 @@
 // ----------------------------- ArduPilot RANGEFINDER -------------------
 #ifndef MAVLINK_MSG_ID_RANGEFINDER
 #define MAVLINK_MSG_ID_RANGEFINDER 173
+#endif
+
+#ifndef MAVLINK_MSG_ID_EKF_STATUS_REPORT
+#define MAVLINK_MSG_ID_EKF_STATUS_REPORT 193
 #endif
 
 // MAV_SENSOR_ORIENTATION enum uses ROTATION_*_FACING values.
@@ -102,12 +123,24 @@ static const uint64_t SENSOR_FRESH_MS = 400;
 static const uint64_t BOOTSTRAP_GRACE_MS = 2000;
 static const uint64_t BOOTSTRAP_FAILSAFE_MS = 1800;
 static const uint64_t FULL_HOVER_FAILSAFE_MS = 900;
-static const uint64_t XY_LOCK_DWELL_MS = 1000;
-static const float VX_LOCK_MAX_MPS = 0.08f;
-static const float VY_LOCK_MAX_MPS = 0.08f;
+static const uint64_t XY_LOCK_DWELL_MS = 500;
+static const float VX_LOCK_MAX_MPS = 0.20f;
+static const float VY_LOCK_MAX_MPS = 0.20f;
+static const uint64_t PRELOCK_TIMEOUT_MS = 4000;    // land if hover never settles enough to achieve XY lock
+static const float PRELOCK_MAX_DRIFT_M = 1.00f;     // abort if prelock drift carries us too far from hover entry
+
+// EKF variance gates for XY lock
+static const float EKF_POS_VAR_LOCK_MAX = 0.30f;    // max pos_horiz_variance to acquire XY lock
+static const float EKF_POS_VAR_BREAK    = 0.50f;    // break XY lock if variance exceeds this
+static const float POSTLOCK_MAX_DRIFT_M = 0.50f;    // break XY lock if position drifts this far from anchor
 
 // ToF constraints
 static const float TOF_MAX_RANGE_M = 4.00f;
+
+// Yaw drift guardian: if the actual heading drifts more than this from the
+// commanded target (e.g. due to magnetometer interference near walls),
+// accept the new heading rather than letting ArduPilot fight to rotate back.
+static const float YAW_DRIFT_ACCEPT_DEG = 15.0f;
 
 // ---------------------- Liftoff assist (no-RC bootstrap) ---------------
 #define RC_CH_ROLL     1
@@ -131,13 +164,24 @@ static const uint64_t TAKEOFF_RAMP_DELAY_MS    = 700;     // start ramp a bit so
 static const float    TAKEOFF_MOT_START_US      = 1150.0f;
 static const uint64_t TAKEOFF_TIMEOUT_MS        = 8000;
 static const uint64_t TAKEOFF_HANDOFF_OFFGROUND_MS = 400;
+static const float    TAKEOFF_HANDOFF_MIN_ALT_M = 0.35f;   // stay in takeoff until we are clearly above ground effect
+static const float    TAKEOFF_HANDOFF_MAX_CLIMB_MPS = 0.15f; // wait for climb rate to settle before hover handoff
+static const float    TAKEOFF_HANDOFF_MAX_XY_MPS = 0.20f;  // do not enter hover while still sliding laterally
+static const uint64_t TAKEOFF_GROUNDED_ABORT_MS = 1000;    // abort if we fall back near the ground after liftoff
 static const float    TAKEOFF_HANDOFF_MAX_TILT_DEG = 20.0f;
-static const float    CEILING_DESCENT_BASE_MPS  = 0.50f;   // min descent speed at ceiling
-static const float    CEILING_DESCENT_MAX_MPS   = 2.50f;   // max descent command at ceiling
+static const float    CEILING_DESCENT_BASE_MPS  = 0.15f;   // min descent speed at ceiling
+static const float    CEILING_DESCENT_MAX_MPS   = 1.00f;   // max descent command at ceiling
+static const float    CEILING_DESCENT_NOLOCK_MAX_MPS = 0.15f; // cap descent when no XY lock (prevents momentum buildup)
+static const float    CEILING_DESCENT_FLOOR_MPS = 0.02f;   // absolute min near taper bottom (prevents momentum buildup)
+static const float    RF_MAX_SLEW_MPS           = 2.0f;    // max RF change rate when airborne (m/s)
+static const float    ALT_MAX_DECAY_ALPHA       = 0.10f;   // peak-hold decay for alt_max (~1s tau at 10Hz)
+static const float    CEILING_RELEASE_VZ_MAX    = 0.20f;   // max descent Vz to allow ceiling release
 
 static bool     takeoff_started                 = false;
 static uint64_t takeoff_started_ms              = 0;
 static uint64_t takeoff_off_ground_since_ms     = 0;
+static bool     takeoff_was_airborne            = false;
+static uint64_t takeoff_grounded_since_ms       = 0;
 static float    takeoff_alt0_m                  = NAN;    // altitude snapshot when NAV_TAKEOFF sent
 static bool     takeoff_att_ramp_was_active     = false;
 
@@ -272,6 +316,13 @@ static uint32_t sys_present = 0;
 static uint32_t sys_enabled = 0;
 static uint32_t sys_health  = 0;
 static uint64_t sys_last_ms = 0;
+
+// EKF_STATUS_REPORT variance
+static bool     have_ekf = false;
+static float    ekf_vel_var        = NAN;
+static float    ekf_pos_horiz_var  = NAN;
+static float    ekf_pos_vert_var   = NAN;
+static uint64_t ekf_last_ms = 0;
 
 // SERVO_OUTPUT_RAW (motor outputs proxy)
 static bool     have_servo = false;
@@ -417,6 +468,7 @@ static float hover_lock_y_m = 0.0f;
 static bool     xy_lock_candidate_active = false;
 static uint64_t xy_lock_candidate_since_ms = 0;
 static HoverPhase hover_phase = HPH_GROUND;
+static uint64_t hover_enter_ms = 0;                // when we entered ST_HOVER
 static uint64_t bootstrap_grace_until_ms = 0;
 static bool     bootstrap_grace_was_active = false;
 static uint64_t hover_health_fail_since_ms = 0;
@@ -425,7 +477,10 @@ static char     hover_ready_fail_last_reason[160] = {0};
 
 // Ceiling logic
 static bool ceiling_active = false;
+static float ceiling_alt_now_m = NAN;   // instantaneous max altitude across current sensors
 static float alt_est_m = NAN;       // selected altitude estimate
+static float rf_slew_m = NAN;          // slew-rate-limited rangefinder for alt estimation
+static uint64_t rf_slew_last_ms = 0;   // timestamp for RF slew limiter
 static float alt_max_m = NAN;       // MAX of available sources for ceiling safety
 static bool alt_rf_rejected = false;
 
@@ -512,6 +567,19 @@ static float wrap_deg(float d) {
 
 static float current_heading_deg(void) {
   return wrap_deg(rad2deg(yaw_rad));
+}
+
+static float hover_yaw_setpoint_deg(void) {
+  if (have_yaw_target) return yaw_target_deg;
+  if (!isnan(hover_hold_yaw_deg)) return hover_hold_yaw_deg;
+  if (have_att) return current_heading_deg();
+  return 0.0f;
+}
+
+static float ceiling_control_alt_m(void) {
+  if (!isnan(ceiling_alt_now_m)) return ceiling_alt_now_m;
+  if (!isnan(alt_est_m)) return alt_est_m;
+  return alt_max_m;
 }
 
 static const char* landed_state_name(uint8_t s) {
@@ -924,8 +992,7 @@ static void send_vel_frame(float vx, float vy, float vz, float yaw_rate_deg_s, u
 static void send_ceiling_hold(float vz_down) {
   if (!have_fc) return;
 
-  float yaw = have_yaw_target ? yaw_target_deg :
-              (!isnan(hover_hold_yaw_deg) ? hover_hold_yaw_deg : 0.0f);
+  float yaw = hover_yaw_setpoint_deg();
 
   static uint64_t last_log = 0;
   uint64_t t = now_ms();
@@ -965,6 +1032,46 @@ static void send_ceiling_hold(float vz_down) {
       mask,
       px, py, 0.0f,
       0.0f, 0.0f, vz_down,
+      0,0,0,
+      deg2rad(yaw), 0
+  );
+  mav_send(&m);
+}
+
+// Pre-lock hover: brake lateral motion with XY velocity control while keeping
+// altitude and yaw under position control. This avoids chasing a distant
+// preliminary XY anchor and re-triggering high-velocity lock failures.
+static void send_prelock_hold(float vx, float vy) {
+  if (!have_fc) return;
+
+  float z_down = hover_target_z_down();
+  float yaw = hover_yaw_setpoint_deg();
+
+  static uint64_t last_log = 0;
+  uint64_t t = now_ms();
+  if (t - last_log > 2000) {
+    last_log = t;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "CMD_PRELOCK vx=%.2f vy=%.2f z=%.2f yaw=%.1f", vx, vy, z_down, yaw);
+    if(log_fp) { fprintf(log_fp, "# %s\n", buf); }
+    if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
+  }
+
+  uint16_t mask =
+      (1<<0)|(1<<1)          // ignore x,y position (use vx,vy)
+    | (1<<5)                 // ignore vz (use z position)
+    | (1<<6)|(1<<7)|(1<<8)   // ignore accel
+    | (1<<11);               // ignore yaw_rate
+
+  mavlink_message_t m;
+  mavlink_msg_set_position_target_local_ned_pack(
+      g_sysid, g_compid, &m,
+      (uint32_t)now_ms(),
+      fc_sysid, fc_compid,
+      MAV_FRAME_LOCAL_NED,
+      mask,
+      0.0f, 0.0f, z_down,
+      vx, vy, 0.0f,
       0,0,0,
       deg2rad(yaw), 0
   );
@@ -1056,7 +1163,7 @@ static void send_attitude_target_thrust(float thrust, float yaw_deg) {
   }
 
   if (thrust < 0.0f) thrust = 0.0f;
-  if (thrust > 0.95f) thrust = 0.95f;
+  if (thrust > 0.80f) thrust = 0.80f;
 
   mavlink_set_attitude_target_t at;
   memset(&at, 0, sizeof(at));
@@ -1161,6 +1268,10 @@ static bool sys_fresh(uint64_t t) {
   return have_sys && (t - sys_last_ms) < 1000;
 }
 
+static bool ekf_fresh(uint64_t t) {
+  return have_ekf && (t - ekf_last_ms) < 1000;
+}
+
 static bool sys_health_bit(uint32_t bit, uint64_t t) {
   if (!sys_fresh(t)) return true;
   return (sys_health & bit) != 0;
@@ -1192,7 +1303,7 @@ static bool xy_ctrl_ok(uint64_t t) {
   if (!sys_fresh(t)) return true;
   bool xy_enabled = (sys_enabled & MAV_SYS_STATUS_SENSOR_XY_POSITION_CONTROL) != 0;
   bool xy_healthy = sys_health_bit(MAV_SYS_STATUS_SENSOR_XY_POSITION_CONTROL, t);
-  return xy_enabled ? xy_healthy : true;
+  return xy_enabled && xy_healthy;
 }
 
 static bool of_fresh(uint64_t t) {
@@ -1443,6 +1554,7 @@ static bool vel_xy_motion_ok(uint64_t t, char* reasons, size_t reasons_sz) {
   if (isnan(alt_max_m) || alt_max_m < HOVER_CAPTURE_MIN_ALT_M) append_reason(reasons, reasons_sz, "alt_too_low");
   if (isfinite(lpos_vx_mps) && fabsf(lpos_vx_mps) >= VX_LOCK_MAX_MPS) append_reason(reasons, reasons_sz, "vx_high");
   if (isfinite(lpos_vy_mps) && fabsf(lpos_vy_mps) >= VY_LOCK_MAX_MPS) append_reason(reasons, reasons_sz, "vy_high");
+  if (ekf_fresh(t) && ekf_pos_horiz_var > EKF_POS_VAR_LOCK_MAX) append_reason(reasons, reasons_sz, "ekf_pos_var_high");
 
   return reasons == NULL || reasons[0] == '\0';
 }
@@ -1473,6 +1585,7 @@ static void init_hover_targets_on_ground(uint64_t t) {
   (void)t;
   hover_xy_locked = false;
   hover_xy_lock_ms = 0;
+  hover_enter_ms = 0;
   hover_lock_x_m = 0.0f;
   hover_lock_y_m = 0.0f;
   xy_lock_candidate_active = false;
@@ -1494,6 +1607,11 @@ static void hover_hold_tick(uint64_t t) {
   if (!have_att) return;
 
   bool lpos_ok = lpos_fresh(t) && isfinite(lpos_x_m) && isfinite(lpos_y_m);
+  if (!hover_xy_locked && lpos_ok && (!isfinite(hover_lock_x_m) || !isfinite(hover_lock_y_m))) {
+    hover_lock_x_m = lpos_x_m;
+    hover_lock_y_m = lpos_y_m;
+  }
+
   if (!hover_xy_locked && vel_xy_stable(t) && lpos_ok) {
     hover_lock_x_m = lpos_x_m;
     hover_lock_y_m = lpos_y_m;
@@ -1501,7 +1619,36 @@ static void hover_hold_tick(uint64_t t) {
     hover_xy_lock_ms = t;
     xy_lock_candidate_active = false;
     xy_lock_candidate_since_ms = 0;
+    // Lock yaw at the stabilised heading, not the stale takeoff heading
+    yaw_target_deg = current_heading_deg();
+    hover_hold_yaw_deg = yaw_target_deg;
     log_bootstrap_event(t, "XY_LOCK_SUCCESS", "velocity_dwell_met");
+  }
+
+  // Break XY lock if EKF position variance spikes or actual position
+  // drifts too far from the lock anchor (EKF origin shift / aiding loss).
+  if (hover_xy_locked && lpos_ok) {
+    bool var_bad = ekf_fresh(t) && ekf_pos_horiz_var > EKF_POS_VAR_BREAK;
+    float dx = lpos_x_m - hover_lock_x_m;
+    float dy = lpos_y_m - hover_lock_y_m;
+    float drift = hypotf(dx, dy);
+    bool drifted = drift >= POSTLOCK_MAX_DRIFT_M;
+
+    if (var_bad || drifted) {
+      printf("HOVER: XY lock broken (%s, drift=%.2fm, ekf_ph=%.2f) -> re-acquire\n",
+             var_bad ? "ekf_var" : "drift", drift, ekf_pos_horiz_var);
+      log_bootstrap_event(t, "XY_LOCK_BREAK",
+                          var_bad ? "ekf_pos_var_high" : "postlock_drift");
+      hover_xy_locked = false;
+      hover_xy_lock_ms = 0;
+      xy_lock_candidate_active = false;
+      xy_lock_candidate_since_ms = 0;
+      // Reset prelock timer so we get a fresh window to re-lock
+      hover_enter_ms = t;
+      // Snap preliminary anchor to current position
+      hover_lock_x_m = lpos_x_m;
+      hover_lock_y_m = lpos_y_m;
+    }
   }
 
   float yaw = have_yaw_target ? yaw_target_deg : current_heading_deg();
@@ -1510,10 +1657,7 @@ static void hover_hold_tick(uint64_t t) {
   if (hover_xy_locked) {
     send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, z_down, yaw);
   } else if (lpos_ok) {
-    // During pre-lock hover, keep refreshing the XY target to the current
-    // local position. This prevents ArduPilot from continuing to chase a stale
-    // NAV_TAKEOFF lateral target while we wait for a stable XY lock.
-    send_pos_yaw_ned(lpos_x_m, lpos_y_m, z_down, yaw);
+    send_prelock_hold(0.0f, 0.0f);
   } else {
     send_z_yaw_ned(z_down, yaw);
   }
@@ -1537,6 +1681,7 @@ static void request_streams(void) {
   send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_OPTICAL_FLOW_RAD,     50000.0f, 0,0,0,0,0);
 
   send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, (float)MAVLINK_MSG_ID_RANGEFINDER,  100000.0f, 0,0,0,0,0);
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, (float)MAVLINK_MSG_ID_EKF_STATUS_REPORT, 200000.0f, 0,0,0,0,0);
 }
 
 // ----------------------------- MAVLink decode handlers -----------------
@@ -1850,6 +1995,16 @@ static void handle_rangefinder_msg(const mavlink_message_t *msg) {
   }
 }
 
+static void handle_ekf_status_report(const mavlink_message_t *msg) {
+  if (msg->len < 22) return;
+  const uint8_t* p = (const uint8_t*)_MAV_PAYLOAD(msg);
+  ekf_vel_var       = rd_f32_le(p + 0);
+  ekf_pos_horiz_var = rd_f32_le(p + 4);
+  ekf_pos_vert_var  = rd_f32_le(p + 8);
+  ekf_last_ms = now_ms();
+  have_ekf = true;
+}
+
 static void handle_statustext(const mavlink_message_t *msg) {
   mavlink_statustext_t s;
   mavlink_msg_statustext_decode(msg, &s);
@@ -1952,6 +2107,7 @@ static void pump_fc_uart(void) {
           case MAVLINK_MSG_ID_OPTICAL_FLOW_RAD:    handle_optical_flow_rad(&msg); break;
           case MAVLINK_MSG_ID_DISTANCE_SENSOR:     handle_distance_sensor(&msg); break;
           case MAVLINK_MSG_ID_RANGEFINDER:         handle_rangefinder_msg(&msg); break;
+          case MAVLINK_MSG_ID_EKF_STATUS_REPORT:   handle_ekf_status_report(&msg); break;
           case MAVLINK_MSG_ID_PARAM_VALUE:         handle_param_value(&msg); break;
           case MAVLINK_MSG_ID_STATUSTEXT:          handle_statustext(&msg); break;
           case MAVLINK_MSG_ID_RC_CHANNELS:         handle_rc_channels(&msg); break;
@@ -2083,13 +2239,12 @@ static void pump_tof_uart(void) {
   for (int i = 0; i < n; i++) {
     uint8_t b = buf[i];
 
-    // --- CTRL parser ---
-    if (ctrl_rxpos == 0) {
-      if (b == CTRL_HEADER) {
-        ctrl_rxbuf[ctrl_rxpos++] = b;
-        continue;
-      }
-    } else {
+    // Whichever parser is mid-frame gets the byte — this prevents the
+    // CTRL parser from stealing bytes out of a 518-byte scan frame when
+    // a data byte happens to match CTRL_HEADER (0xA6).
+
+    // --- CTRL parser continuation (mid-frame) ---
+    if (ctrl_rxpos > 0) {
       ctrl_rxbuf[ctrl_rxpos++] = b;
       if (ctrl_rxpos == CTRL_BYTES) {
         uint8_t c = xor8(ctrl_rxbuf, CTRL_BYTES-1);
@@ -2101,19 +2256,24 @@ static void pump_tof_uart(void) {
       continue;
     }
 
-    // --- SCAN parser ---
-    if (tof_rxpos == 0) {
-      if (b != SCAN_HEADER) continue;
+    // --- SCAN parser continuation (mid-frame) ---
+    if (tof_rxpos > 0) {
+      tof_rxbuf[tof_rxpos++] = b;
+      if (tof_rxpos == SCAN_BYTES) {
+        uint8_t c = xor8(tof_rxbuf, SCAN_BYTES-1);
+        if (c == tof_rxbuf[SCAN_BYTES-1]) {
+          accept_scan_frame(tof_rxbuf);
+        }
+        tof_rxpos = 0;
+      }
+      continue;
     }
 
-    tof_rxbuf[tof_rxpos++] = b;
-
-    if (tof_rxpos == SCAN_BYTES) {
-      uint8_t c = xor8(tof_rxbuf, SCAN_BYTES-1);
-      if (c == tof_rxbuf[SCAN_BYTES-1]) {
-        accept_scan_frame(tof_rxbuf);
-      }
-      tof_rxpos = 0;
+    // --- Neither parser active: check for frame headers ---
+    if (b == CTRL_HEADER) {
+      ctrl_rxbuf[ctrl_rxpos++] = b;
+    } else if (b == SCAN_HEADER) {
+      tof_rxbuf[tof_rxpos++] = b;
     }
   }
 }
@@ -2139,6 +2299,42 @@ static void update_alt_estimate(void) {
 
   have_xy = lpos_fresh;
 
+  // Reject rangefinder when tilted beyond 30 deg — beam no longer points down
+  bool rf_tilt_ok = true;
+  if (have_att && (fabsf(roll_rad) > 0.52f || fabsf(pitch_rad) > 0.52f))
+    rf_tilt_ok = false;
+
+  // --- Slew-rate-limited RF for altitude estimation ---
+  // Prevents terrain discontinuities (flying over pillows, bed edges, etc.)
+  // from corrupting the altitude estimate.  Raw RF is still used for ceiling
+  // TRIGGER so the ceiling activates immediately on real climbs.
+  float rf_slew = NAN;
+  if (range_fresh && rf_tilt_ok && !isnan(rangefinder_m)) {
+    float rf_raw = rangefinder_m;
+    if (rf_raw < 0.0f) rf_raw = 0.0f;
+    if (rf_raw > 10.0f) rf_raw = 10.0f;
+    rf_slew = rf_raw;
+
+    bool airborne = (have_ext && landed_state != MAV_LANDED_STATE_ON_GROUND);
+    if (airborne && !isnan(rf_slew_m) && rf_slew_last_ms > 0) {
+      float dt_s = (float)(tnow - rf_slew_last_ms) * 0.001f;
+      if (dt_s > 0.001f && dt_s < 1.0f) {
+        float max_delta = RF_MAX_SLEW_MPS * dt_s;
+        float delta = rf_slew - rf_slew_m;
+        if (fabsf(delta) > max_delta) {
+          rf_slew = rf_slew_m + copysignf(max_delta, delta);
+        }
+      }
+    }
+    rf_slew_m = rf_slew;
+    rf_slew_last_ms = tnow;
+  }
+  // Reset slew state on the ground so takeoff starts with a clean baseline
+  if (!fc_armed || near_ground) {
+    rf_slew_m = NAN;
+    rf_slew_last_ms = 0;
+  }
+
   // Compute max altitude for ceiling safety (independent of chosen alt_est source)
   float max_alt = NAN;
   if (lpos_fresh && !isnan(lpos_alt_filt_m)) {
@@ -2147,7 +2343,7 @@ static void update_alt_estimate(void) {
     if (a > 50.0f) a = 50.0f;
     max_alt = isnan(max_alt) ? a : fmaxf(max_alt, a);
   }
-  if (range_fresh && !isnan(rangefinder_m)) {
+  if (range_fresh && rf_tilt_ok && !isnan(rangefinder_m)) {
     float rf = rangefinder_m;
     if (rf < 0.0f) rf = 0.0f;
     if (rf > 10.0f) rf = 10.0f;
@@ -2156,17 +2352,27 @@ static void update_alt_estimate(void) {
   if (near_ground) {
     max_alt = isnan(max_alt) ? 0.0f : fmaxf(max_alt, 0.0f);
   }
-  alt_max_m = max_alt;
+  ceiling_alt_now_m = max_alt;
+  // Decaying peak hold: rises instantly (safety — catch real ceiling approaches),
+  // decays slowly so terrain RF jumps don't prematurely release ceiling mode.
+  if (!isnan(alt_max_m) && !isnan(max_alt) && fc_armed) {
+    if (max_alt >= alt_max_m) {
+      alt_max_m = max_alt;
+    } else {
+      alt_max_m = alt_max_m * (1.0f - ALT_MAX_DECAY_ALPHA) + max_alt * ALT_MAX_DECAY_ALPHA;
+    }
+  } else {
+    alt_max_m = max_alt;
+  }
 
-  // Pick best altitude estimate for control logic (RF preferred if sane)
+  // Pick best altitude estimate for control logic
+  // Uses slew-limited RF to reject terrain discontinuities (pillows, bed edges, etc.)
   float  new_alt = NAN;
   AltSrc new_src = ALT_SRC_NONE;
   alt_rf_rejected = false;
 
-  if (range_fresh && !isnan(rangefinder_m)) {
-    float rf = rangefinder_m;
-    if (rf < 0.0f) rf = 0.0f;
-    if (rf > 10.0f) rf = 10.0f;
+  if (!isnan(rf_slew)) {
+    float rf = rf_slew;
 
     bool rf_ok = true;
 
@@ -2205,8 +2411,17 @@ static void update_alt_estimate(void) {
   // Trigger before the hard ceiling so the FC has room to arrest an indoor climb.
   const float ceiling_trigger_m = CEIL_M - CEIL_MARGIN_M;
   const float ceiling_release_m = ceiling_trigger_m - 0.10f;
-  if (!isnan(alt_max_m) && alt_max_m >= ceiling_trigger_m) ceiling_active = true;
-  if (!isnan(alt_max_m) && alt_max_m <= ceiling_release_m) ceiling_active = false;
+  bool ceiling_trigger_now  = !isnan(ceiling_alt_now_m) && ceiling_alt_now_m >= ceiling_trigger_m;
+  bool ceiling_trigger_peak = !isnan(alt_max_m) && alt_max_m >= ceiling_trigger_m;
+  if (ceiling_trigger_now || ceiling_trigger_peak) ceiling_active = true;
+  // Don't release ceiling mode while still descending fast — handing off to
+  // the hover position controller with high downward velocity causes a crash.
+  float ceil_vz = isnan(lpos_vz_mps) ? 0.0f : lpos_vz_mps;
+  float ceiling_release_alt = ceiling_control_alt_m();
+  if (ceiling_active && !isnan(ceiling_release_alt) &&
+      ceiling_release_alt <= ceiling_release_m && ceil_vz < CEILING_RELEASE_VZ_MAX)
+    ceiling_active = false;
+  if (!fc_armed) ceiling_active = false;
 }
 
 // ----------------------------- Logging ---------------------------------
@@ -2232,7 +2447,8 @@ static void log_init(void) {
               "lpos_alt_m,lpos_alt_filt_m,z_tgt_down_m,cmd_vz_ned_mps,ceiling_active,"
               "takeoff_sent,takeoff_started,off_ground,hover_xy_locked,"
               "x_m,y_m,vx_mps,vy_mps,yaw_deg,of_q,of_rate_x,of_rate_y,"
-              "tof_f,tof_r,tof_b,tof_l,batt_v,batt_cells\n");
+              "tof_f,tof_r,tof_b,tof_l,batt_v,batt_cells,"
+              "ekf_ph_var,ekf_vel_var\n");
       fflush(log_fp);
     }
   }
@@ -2530,8 +2746,11 @@ static void log_tick(uint64_t t) {
     fprintf(log_fp, "%.3f,%.3f,%.3f,%.3f,",
             tof_filt_m[D_FRONT], tof_filt_m[D_RIGHT], tof_filt_m[D_BACK], tof_filt_m[D_LEFT]);
 
-    if (!isnan(batt_v_total) && batt_cells > 0) fprintf(log_fp, "%.3f,%d\n", batt_v_total, batt_cells);
-    else fprintf(log_fp, "nan,0\n");
+    if (!isnan(batt_v_total) && batt_cells > 0) fprintf(log_fp, "%.3f,%d,", batt_v_total, batt_cells);
+    else fprintf(log_fp, "nan,0,");
+
+    if (ekf_fresh(t)) fprintf(log_fp, "%.3f,%.3f\n", ekf_pos_horiz_var, ekf_vel_var);
+    else fprintf(log_fp, "nan,nan\n");
   }
 
   log_scan_record();
@@ -2549,6 +2768,7 @@ static void enter_state(State ns, const char* reason) {
   if (leaving_hover) {
     hover_xy_locked = false;
     hover_xy_lock_ms = 0;
+    hover_enter_ms = 0;
     hover_lock_x_m = hover_lock_y_m = 0.0f;
     xy_lock_candidate_active = false;
     xy_lock_candidate_since_ms = 0;
@@ -2567,6 +2787,8 @@ static void enter_state(State ns, const char* reason) {
     takeoff_started = false;
     takeoff_started_ms = 0;
     takeoff_off_ground_since_ms = 0;
+    takeoff_was_airborne = false;
+    takeoff_grounded_since_ms = 0;
     takeoff_att_ramp_active = false;
     takeoff_att_ramp_start_ms = 0;
     takeoff_alt0_m = alt_max_m;
@@ -2588,10 +2810,23 @@ static void enter_state(State ns, const char* reason) {
   if (entering_hover) {
     hover_xy_locked = false;
     hover_xy_lock_ms = 0;
-    hover_lock_x_m = hover_lock_y_m = 0.0f;
+    hover_enter_ms = now_ms();
+    // Capture hover-entry position as the prelock drift reference. Once XY
+    // velocity settles we re-capture the true lock point at the settled pose.
+    if (have_xy && isfinite(lpos_x_m) && isfinite(lpos_y_m)) {
+      hover_lock_x_m = lpos_x_m;
+      hover_lock_y_m = lpos_y_m;
+    } else {
+      hover_lock_x_m = hover_lock_y_m = NAN;
+    }
     xy_lock_candidate_active = false;
     xy_lock_candidate_since_ms = 0;
-    printf("HOVER: reset XY capture (enter)\n");
+    if (have_att) {
+      yaw_target_deg = current_heading_deg();
+      hover_hold_yaw_deg = yaw_target_deg;
+      have_yaw_target = true;
+    }
+    printf("HOVER: preliminary XY capture (%.2f, %.2f)\n", hover_lock_x_m, hover_lock_y_m);
   }
 
   if (ns == ST_LANDING) {
@@ -2678,6 +2913,7 @@ static void liftoff_assist_tick(uint64_t t) {
 
   if ((t - assist_start_ms) > ASSIST_ABORT_MS) {
     printf("LIFTOFF_ASSIST: timeout (alt=%.2fm). Disarming for safety.\n", alt_max_m);
+    want_arm = false;
     enter_state(ST_DISARMING, "Assist Timeout");
     return;
   }
@@ -2784,6 +3020,19 @@ static bool takeoff_attitude_stable(void) {
          fabsf(rad2deg(pitch_rad)) <= TAKEOFF_HANDOFF_MAX_TILT_DEG;
 }
 
+static bool takeoff_near_ground(uint64_t t) {
+  bool landed_ground = have_ext && landed_state == MAV_LANDED_STATE_ON_GROUND;
+  bool rf_ground = rf_fresh(t) && !isnan(rangefinder_m) && rangefinder_m < 0.06f;
+  bool alt_ground = !isnan(alt_est_m) && alt_est_m < 0.08f;
+  return landed_ground || rf_ground || alt_ground;
+}
+
+static bool takeoff_confidently_grounded(uint64_t t) {
+  bool landed_ground = have_ext && landed_state == MAV_LANDED_STATE_ON_GROUND;
+  bool rf_ground = rf_fresh(t) && !isnan(rangefinder_m) && rangefinder_m < 0.05f;
+  return landed_ground || rf_ground;
+}
+
 static bool takeoff_hover_handoff_ready(uint64_t t, bool off_ground) {
   if (!off_ground) {
     takeoff_off_ground_since_ms = 0;
@@ -2798,7 +3047,17 @@ static bool takeoff_hover_handoff_ready(uint64_t t, bool off_ground) {
   if ((t - takeoff_off_ground_since_ms) < TAKEOFF_HANDOFF_OFFGROUND_MS) return false;
   // Do not enter hover-hold while still in extreme ground effect. The hold
   // logic assumes we are clearly airborne before it starts clamping altitude.
-  if (isnan(alt_max_m) || alt_max_m < HOVER_CAPTURE_MIN_ALT_M) return false;
+  float current_alt = ceiling_control_alt_m();
+  if (isnan(current_alt) || current_alt < TAKEOFF_HANDOFF_MIN_ALT_M) return false;
+  if (!lpos_fresh(t) || !isfinite(lpos_vz_mps) ||
+      !isfinite(lpos_vx_mps) || !isfinite(lpos_vy_mps)) {
+    return false;
+  }
+  if (lpos_vz_mps < -TAKEOFF_HANDOFF_MAX_CLIMB_MPS) return false;
+  if (fabsf(lpos_vx_mps) > TAKEOFF_HANDOFF_MAX_XY_MPS ||
+      fabsf(lpos_vy_mps) > TAKEOFF_HANDOFF_MAX_XY_MPS) {
+    return false;
+  }
   return takeoff_attitude_stable();
 }
 
@@ -2901,9 +3160,12 @@ static void print_snap_line(FILE* f, const snapshot_t* s) {
   fprintf(f, "Alt%.2f(%s) RF%.2f ", s->alt_est, alt_src_name((AltSrc)s->alt_src), s->rf_m);
   
   // EKF/Sys
-  fprintf(f, "[%c%c%c%c] ", 
+  fprintf(f, "[%c%c%c%c] ",
     s->xy_ok?'X':'.', s->z_ok?'Z':'.', s->gyr_ok?'G':'.', s->mot_ok?'M':'.');
-    
+
+  // EKF variance (pos_horiz, vel)
+  if (have_ekf) fprintf(f, "EKF(ph%.2f v%.2f) ", ekf_pos_horiz_var, ekf_vel_var);
+
   // OF
   fprintf(f, "OF(Q%u %.2f %.2f) ", s->of_q, s->of_rx, s->of_ry);
   
@@ -3033,6 +3295,9 @@ static void control_tick(void) {
   poll_bootstrap_grace(t);
   sync_hover_phase(t);
 
+  bool ceiling_override_pending = false;
+  float ceiling_override_vz = NAN;
+
   // want_arm dropped while armed -> FORCE DISARM immediately (any state/mode)
   if (!want_arm && fc_armed) {
     last_disarm_cmd_ms = 0;
@@ -3041,14 +3306,30 @@ static void control_tick(void) {
     goto control_tick_done;
   }
 
+  // Yaw drift guardian (runs before ceiling checks which skip hover_hold_tick).
+  // Prevents ArduPilot from actively rotating toward a wall when the
+  // magnetometer reference shifts near ferromagnetic surfaces.
+  if (fc_armed && have_att && have_yaw_target && (st == ST_TAKEOFF || st == ST_HOVER)) {
+    float yaw_err = wrap_deg(current_heading_deg() - yaw_target_deg);
+    if (fabsf(yaw_err) > YAW_DRIFT_ACCEPT_DEG) {
+      float new_yaw = current_heading_deg();
+      printf("YAW_DRIFT: heading=%.1f target=%.1f err=%.1f -> accepting current heading\n",
+             new_yaw, yaw_target_deg, yaw_err);
+      yaw_target_deg = new_yaw;
+      hover_hold_yaw_deg = new_yaw;
+    }
+  }
+
   // Pre-ceiling braking: decelerate climbs before the ceiling descent mode takes over.
-  if (fc_armed && !ceiling_active && !isnan(alt_max_m) && !isnan(lpos_vz_mps)
-      && alt_max_m > (CEIL_M - CEIL_MARGIN_M - 0.05f) && lpos_vz_mps < -0.15f) {
+  float ceiling_alt = ceiling_control_alt_m();
+  if (fc_armed && !ceiling_active && !isnan(ceiling_alt) && !isnan(lpos_vz_mps)
+      && ceiling_alt > (CEIL_M - CEIL_MARGIN_M - 0.05f) && lpos_vz_mps < -0.15f) {
     float brake_vz = (-lpos_vz_mps) * 0.9f;   // counter most of the climb rate before the hard limit
     if (brake_vz < 0.20f) brake_vz = 0.20f;
-    if (brake_vz > 2.0f)  brake_vz = 2.0f;
-    send_ceiling_hold(brake_vz);
-    goto control_tick_done;
+    float brake_max = hover_xy_locked ? 2.0f : CEILING_DESCENT_NOLOCK_MAX_MPS;
+    if (brake_vz > brake_max) brake_vz = brake_max;
+    ceiling_override_pending = true;
+    ceiling_override_vz = brake_vz;
   }
 
   // Ceiling safety: proportional descent with velocity compensation.
@@ -3057,24 +3338,26 @@ static void control_tick(void) {
   if (ceiling_active && fc_armed) {
     const float ceiling_trigger_m = CEIL_M - CEIL_MARGIN_M;
     const float ceiling_release_m = ceiling_trigger_m - 0.10f;
-    float overshoot = (!isnan(alt_max_m)) ? (alt_max_m - CEIL_M) : 0.0f;
+    float control_alt = ceiling_control_alt_m();
+    float overshoot = (!isnan(control_alt)) ? (control_alt - CEIL_M) : 0.0f;
     if (overshoot < 0.0f) overshoot = 0.0f;
-    float vz_cmd = CEILING_DESCENT_BASE_MPS + overshoot * 4.0f;
+    float vz_cmd = CEILING_DESCENT_BASE_MPS + overshoot * 2.0f;
     // Counteract upward velocity (negative lpos_vz = climbing in NED)
     float cur_vz = isnan(lpos_vz_mps) ? 0.0f : lpos_vz_mps;
     if (cur_vz < 0.0f)
       vz_cmd += (-cur_vz);
     // Taper descent as we approach the release altitude so hover can take over smoothly
-    if (!isnan(alt_max_m) && alt_max_m < ceiling_trigger_m) {
-      float frac = (alt_max_m - ceiling_release_m) / (ceiling_trigger_m - ceiling_release_m);
+    if (!isnan(control_alt) && control_alt < ceiling_trigger_m) {
+      float frac = (control_alt - ceiling_release_m) / (ceiling_trigger_m - ceiling_release_m);
       if (frac < 0.1f) frac = 0.1f;
       if (frac > 1.0f) frac = 1.0f;
       vz_cmd *= frac;
     }
-    if (vz_cmd < 0.10f) vz_cmd = 0.10f;
-    if (vz_cmd > CEILING_DESCENT_MAX_MPS) vz_cmd = CEILING_DESCENT_MAX_MPS;
-    send_ceiling_hold(vz_cmd);
-    goto control_tick_done;
+    if (vz_cmd < CEILING_DESCENT_FLOOR_MPS) vz_cmd = CEILING_DESCENT_FLOOR_MPS;
+    float max_vz = hover_xy_locked ? CEILING_DESCENT_MAX_MPS : CEILING_DESCENT_NOLOCK_MAX_MPS;
+    if (vz_cmd > max_vz) vz_cmd = max_vz;
+    ceiling_override_pending = true;
+    ceiling_override_vz = vz_cmd;
   }
 
   if (fc_armed && (st == ST_TAKEOFF || st == ST_HOVER)) {
@@ -3167,6 +3450,10 @@ static void control_tick(void) {
       float mot_avg = servo_fresh ? servo_motor_avg() : NAN;
       bool mot_started = servo_fresh && (mot_avg > TAKEOFF_MOT_START_US);
       bool off_ground = takeoff_off_ground(t);
+      if (off_ground) {
+        takeoff_was_airborne = true;
+        takeoff_grounded_since_ms = 0;
+      }
       bool alt_rising = (!isnan(takeoff_alt0_m) && !isnan(alt_max_m) && (alt_max_m - takeoff_alt0_m) > 0.05f);
       bool handoff_ready = takeoff_hover_handoff_ready(t, off_ground);
 
@@ -3227,7 +3514,27 @@ static void control_tick(void) {
         break;
       }
 
-      if (!isnan(alt_max_m) && alt_max_m >= (TAKEOFF_TARGET_M - 0.05f)) {
+      if (takeoff_was_airborne && !off_ground && takeoff_near_ground(t)) {
+        if (takeoff_grounded_since_ms == 0) takeoff_grounded_since_ms = t;
+        if ((t - takeoff_grounded_since_ms) >= TAKEOFF_GROUNDED_ABORT_MS) {
+          bool motors_low = !servo_fresh || mot_avg < (TAKEOFF_MOT_START_US + 25.0f);
+          if (motors_low && takeoff_confidently_grounded(t)) {
+            printf("TAKEOFF: back on ground after liftoff -> DISARMING\n");
+            want_arm = false;
+            enter_state(ST_DISARMING, "Takeoff Grounded");
+          } else {
+            printf("TAKEOFF: back near ground after liftoff -> LANDING\n");
+            enter_state(ST_LANDING, "Takeoff Recovery");
+          }
+          break;
+        }
+      } else {
+        takeoff_grounded_since_ms = 0;
+      }
+
+      float takeoff_alt_now = ceiling_control_alt_m();
+      bool target_height_reached = !isnan(takeoff_alt_now) && takeoff_alt_now >= (TAKEOFF_TARGET_M - 0.05f);
+      if (target_height_reached && handoff_ready) {
         if (!have_yaw_target && have_att) {
           have_yaw_target = true;
           yaw_target_deg = current_heading_deg();
@@ -3261,6 +3568,29 @@ static void control_tick(void) {
       // Continuous hover clamp: Z-only until XY lock, then full XYZ hold.
       hover_hold_tick(t);
       sync_hover_phase(t);
+
+      if (!hover_xy_locked) {
+        if (hover_enter_ms != 0 && (t - hover_enter_ms) >= PRELOCK_TIMEOUT_MS) {
+          log_bootstrap_event(t, "LANDING_FAILSAFE", "prelock_timeout");
+          printf("HOVER: prelock timeout (%.1fs without XY lock) -> LANDING\n",
+                 (float)(t - hover_enter_ms) * 0.001f);
+          enter_state(ST_LANDING, "Prelock Timeout");
+          break;
+        }
+
+        if (lpos_fresh(t) && isfinite(lpos_x_m) && isfinite(lpos_y_m) &&
+            isfinite(hover_lock_x_m) && isfinite(hover_lock_y_m)) {
+          float dx = lpos_x_m - hover_lock_x_m;
+          float dy = lpos_y_m - hover_lock_y_m;
+          float drift_m = hypotf(dx, dy);
+          if (drift_m >= PRELOCK_MAX_DRIFT_M) {
+            log_bootstrap_event(t, "LANDING_FAILSAFE", "prelock_drift");
+            printf("HOVER: prelock drift %.2fm from entry anchor -> LANDING\n", drift_m);
+            enter_state(ST_LANDING, "Prelock Drift");
+            break;
+          }
+        }
+      }
     } break;
 
     case ST_LANDING: {
@@ -3280,6 +3610,7 @@ static void control_tick(void) {
 
       bool near_ground = (!isnan(alt_max_m) && alt_max_m < 0.10f);
       if (near_ground || (have_ext && landed_state == MAV_LANDED_STATE_ON_GROUND)) {
+        want_arm = false;
         enter_state(ST_DISARMING, "Landed");
       }
     } break;
@@ -3297,6 +3628,11 @@ static void control_tick(void) {
     default:
       enter_state(ST_IDLE, "Default");
       break;
+  }
+
+  if (ceiling_override_pending && fc_armed &&
+      (st == ST_TAKEOFF || st == ST_HOVER)) {
+    send_ceiling_hold(ceiling_override_vz);
   }
 
 control_tick_done:
