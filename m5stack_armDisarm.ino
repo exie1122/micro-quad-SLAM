@@ -5,7 +5,7 @@
 #include <esp_wifi_types.h>
 
 // ================= ESP-NOW CONFIG =================
-static uint8_t PEER_MAC[6] = { 0x9C, 0x13, 0x9E, 0xF4, 0x27, 0x0C };
+static uint8_t PEER_MAC[6] = { 0x9C, 0x13, 0x9E, 0xF4, 0x29, 0x38 };
 static constexpr uint8_t ESPNOW_CHANNEL = 1;
 
 enum : uint8_t { CMD_DISARM = 0, CMD_ARM = 1 };
@@ -120,17 +120,14 @@ static void drawButton(
   int dx = pressed ? 2 : 0;
   int dy = pressed ? 2 : 0;
 
-  // Background
   CoreS3.Display.fillRoundRect(r.x, r.y, r.w, r.h, RADIUS, C_BG);
   CoreS3.Display.fillRoundRect(r.x+dx, r.y+dy, r.w, r.h, RADIUS, base);
   CoreS3.Display.drawRoundRect(r.x+dx, r.y+dy, r.w, r.h, RADIUS, C_TEXT);
 
-  // ---------- TEXT ZONE ----------
   int textTop = r.y + PAD;
   int textBottom = r.y + r.h - PAD;
 
   if (isArm) {
-    // reserve space for progress bar
     textBottom -= (BAR_H + GAP);
   }
 
@@ -141,11 +138,10 @@ static void drawButton(
   CoreS3.Display.setTextColor(C_TEXT, base);
   CoreS3.Display.drawString(label, r.x + r.w / 2 + dx, textY + dy);
 
-  // ---------- ARM PROGRESS BAR ----------
   if (isArm) {
     int barW = r.w - PAD * 2;
     int barX = r.x + PAD + dx;
-    int barY = r.y + r.h - PAD - BAR_H + dy;
+    int barY = r.y + r.h - PAD - BAR_H + dy + 28;
 
     CoreS3.Display.fillRoundRect(barX, barY, barW, BAR_H, 6, C_DARK);
 
@@ -155,7 +151,6 @@ static void drawButton(
     }
   }
 }
-
 
 // ================= ESP-NOW =================
 static void espnowInit(){
@@ -172,11 +167,24 @@ static void espnowInit(){
   esp_now_add_peer(&p);
 }
 
-static void sendCmd(uint8_t cmd){
-  ArmMsg m{0xC3,cmd,++seqNo,millis()};
-  sendCbFired=false;
-  esp_now_send(PEER_MAC,(uint8_t*)&m,sizeof(m));
-  drawStatus(cmd==CMD_ARM?"Sending ARM...":"Sending DISARM...",C_YELLOW);
+static void sendCmd(uint8_t cmd, uint8_t repeats = 1, uint16_t gapMs = 8){
+  drawStatus(
+    cmd == CMD_ARM
+      ? "Sending ARM..."
+      : (repeats == 2 ? "Sending DISARM x2..." : "Sending DISARM..."),
+    C_YELLOW
+  );
+
+  sendCbFired = false;
+
+  for (uint8_t i = 0; i < repeats; i++) {
+    ArmMsg m{0xC3, cmd, ++seqNo, millis()};
+    esp_now_send(PEER_MAC, (uint8_t*)&m, sizeof(m));
+
+    if (i + 1 < repeats) {
+      delay(gapMs);
+    }
+  }
 }
 
 // ================= TOUCH =================
@@ -228,16 +236,17 @@ void loop(){
     drawButton(R_ARM,C_GREEN,"ARM",true,true,pct);
     if (!armTriggered && pct>=100){
       armTriggered=true;
-      sendCmd(CMD_ARM);
+      sendCmd(CMD_ARM, 2);  // 2-frame requirement
     }
   }
+
 
   if (!nowTouch && touching){
     touching=false;
     drawButton(R_ARM,C_GREEN,"ARM",false,true,0);
     drawButton(R_DISARM,C_RED,"DISARM",false);
     if (R_DISARM.contains(sx,sy) && R_DISARM.contains(lastX,lastY))
-      sendCmd(CMD_DISARM);
+      sendCmd(CMD_DISARM, 2);
   }
 
   if (sendCbFired){
