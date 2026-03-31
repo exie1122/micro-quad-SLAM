@@ -15,41 +15,36 @@
 #define GRID_SIZE   64
 #define TOTAL_CELLS (NUM_SENSORS * GRID_SIZE)
 
-// ----------------- Physical orientation -----------------
 enum Dir { FRONT = 0, RIGHT, BACK, LEFT };
 
-// Physical direction → wiring index
 const int dirToSensor[4] = {
-  3,  // FRONT -> S4
-  1,  // RIGHT -> S2
-  2,  // BACK  -> S3
-  0   // LEFT  -> S1
+  3,
+  1,
+  2,
+  0
 };
 
-// ----------------- I2C bus pins -----------------
 struct BusPins { uint8_t sda; uint8_t scl; };
 
 BusPins pins[NUM_SENSORS] = {
-  {2,  1},   // S1 (left)
-  {4,  3},   // S2 (right)
-  {12, 13},  // S3 (back)
-  {11, 10}   // S4 (front)
+  {4, 3},
+  {2, 1},
+  {12, 13},
+  {6, 5}
 };
 
-// ----------------- UART ToF Packet (unchanged) -----------------
 #define SCAN_HEADER 0xA5
-#define SCAN_BYTES  (1 + 4 + (TOTAL_CELLS * 2) + 1) // 518
+#define SCAN_BYTES  (1 + 4 + (TOTAL_CELLS * 2) + 1)
 static uint8_t txbuf[SCAN_BYTES];
 
-// ----------------- UART Control Frame to Luckfox -----------------
 #define CTRL_HEADER 0xA6
 #define CTRL_BYTES  7
 
 enum : uint8_t { CMD_DISARM = 0, CMD_ARM = 1 };
 
 struct __attribute__((packed)) ArmMsg {
-  uint8_t  magic;   // 0xC3
-  uint8_t  cmd;     // 0=DISARM, 1=ARM
+  uint8_t  magic;
+  uint8_t  cmd;
   uint32_t seq;
   uint32_t t_ms;
 };
@@ -60,14 +55,12 @@ static volatile bool     g_haveCmd = false;
 static volatile uint8_t  g_cmd     = 0;
 static volatile uint32_t g_seq     = 0;
 
-// ----------------- Globals -----------------
 SparkFun_VL53L5CX tof[NUM_SENSORS];
 VL53L5CX_ResultsData dataArr[NUM_SENSORS];
 bool ok[NUM_SENSORS] = {false, false, false, false};
 
 HardwareSerial SBC(1);
 
-// ----------------- Utilities -----------------
 static uint8_t checksum8(const uint8_t *buf, size_t len) {
   uint8_t c = 0;
   for (size_t i = 0; i < len; i++) c ^= buf[i];
@@ -94,13 +87,11 @@ void bindBus(int i) {
   delayMicroseconds(200);
 }
 
-// SparkFun orientation correction
 uint16_t getCell(const VL53L5CX_ResultsData &m, int row, int col) {
   int x = 7 - col;
   return m.distance_mm[x + row * 8];
 }
 
-// ----------------- ESP-NOW -----------------
 static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   (void)info;
   if (len != (int)sizeof(ArmMsg)) return;
@@ -127,7 +118,6 @@ static void espnowInit() {
   esp_now_register_recv_cb(onEspNowRecv);
 }
 
-// Forward command to Luckfox over UART3 stream (same as ToF stream)
 static void forwardCmdToLuckfox(uint8_t cmd, uint32_t seq) {
   uint8_t b[CTRL_BYTES];
   b[0] = CTRL_HEADER;
@@ -137,15 +127,12 @@ static void forwardCmdToLuckfox(uint8_t cmd, uint32_t seq) {
   SBC.write(b, CTRL_BYTES);
 }
 
-// ----------------- Setup -----------------
 void setup() {
   Serial.begin(115200);
 
-  // Initialize WiFi FIRST
   WiFi.mode(WIFI_STA);
-  delay(100);   // <-- critical on ESP32-S3
+  delay(100);
 
-  // Print ONLY own MAC once (guaranteed correct)
   uint8_t mac[6];
   esp_wifi_get_mac(WIFI_IF_STA, mac);
   Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -155,23 +142,32 @@ void setup() {
 
   espnowInit();
 
-  // Init sensors (no printing)
+  Serial.println("=== SENSOR INIT START ===");
+
   for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.printf("Sensor %d -> SDA=%d SCL=%d\n", i, pins[i].sda, pins[i].scl);
+
     bindBus(i);
+
     if (!tof[i].begin()) {
       ok[i] = false;
+      Serial.println("INIT FAILED");
       continue;
     }
+
+    Serial.println("INIT OK");
+
     tof[i].setResolution(64);
     tof[i].setRangingFrequency(10);
     tof[i].startRanging();
+
     ok[i] = true;
   }
+
+  Serial.println("=== SENSOR INIT DONE ===");
 }
 
-// ----------------- Main loop -----------------
 void loop() {
-  // 0) If new ESP-NOW cmd arrived, forward to Luckfox immediately
   if (g_haveCmd) {
     Serial.println("Recieved Arm Command!");
     uint8_t  cmd = g_cmd;
@@ -180,7 +176,6 @@ void loop() {
     forwardCmdToLuckfox(cmd, seq);
   }
 
-  // 1) Snapshot all sensors
   for (int i = 0; i < NUM_SENSORS; i++) {
     if (!ok[i]) continue;
     bindBus(i);
@@ -189,7 +184,27 @@ void loop() {
     }
   }
 
-  // 2) Build fixed 518-byte packet in physical order: FRONT → RIGHT → BACK → LEFT
+  Serial.println("---- SENSOR STATUS ----");
+
+  for (int i = 0; i < NUM_SENSORS; i++) {
+    Serial.printf("Sensor %d: ", i);
+
+    if (!ok[i]) {
+      Serial.println("NOT INITIALIZED");
+      continue;
+    }
+
+    bindBus(i);
+
+    if (tof[i].isDataReady()) {
+      Serial.println("DATA READY");
+    } else {
+      Serial.println("NO DATA");
+    }
+  }
+
+  Serial.println("-----------------------");
+
   memset(txbuf, 0, sizeof(txbuf));
   txbuf[0] = SCAN_HEADER;
 
@@ -210,7 +225,6 @@ void loop() {
 
   txbuf[SCAN_BYTES - 1] = checksum8(txbuf, SCAN_BYTES - 1);
 
-  // 3) Publish ToF frame
   SBC.write(txbuf, SCAN_BYTES);
 
   delay(80);
