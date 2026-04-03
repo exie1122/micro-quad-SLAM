@@ -13,9 +13,6 @@ The goal is to explore whether a highly constrained nano-quadcopter platform can
 
 ---
 
-[![Interactive 3D demo](./assets/scan-preview.gif)](https://exie1122.github.io/)
-
-
 
 ## Features
 
