@@ -142,6 +142,14 @@ Key observations:
 
 ## Build
 
+### SCP Command: log.txt
+```
+scp root@10.98.143.1:/mnt/sdcard/log.txt "$env:USERPROFILE\Downloads\log.txt"
+```
+### SCP Command: scanlog.bin
+```
+scp root@10.98.143.1:/mnt/data/scanlog.bin "$env:USERPROFILE\Downloads\scanlog.bin"
+```
 ### Compile Command
 
 ```bash
