@@ -2,6 +2,7 @@ import struct
 import sys
 import math
 import argparse
+import os
 try:
     import tkinter as tk
     from tkinter import filedialog
@@ -17,6 +18,11 @@ except ImportError as e:
     print("Please install them with: pip install numpy matplotlib")
     sys.exit(1)
 
+try:
+    from scipy import ndimage as ndi
+except ImportError:
+    ndi = None
+
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
@@ -26,8 +32,15 @@ MAX_DISPLAY_POINTS = 200000
 MAX_TRAJECTORY_POINTS = 20000
 OCCUPANCY_CELL_SIZE_M = 0.10
 OCCUPANCY_SATURATION_HITS = 8.0
+OCCUPANCY_MIN_HIT_THRESHOLD = 3
 MIN_OCCUPANCY_CELL_SIZE_M = 0.05
 MAX_OCCUPANCY_CELL_SIZE_M = 0.25
+# Poster export / morphology parameters
+POSTER_MORPH_CLOSING_SIZE = 3       # Square kernel for closing (bridges short gaps)
+POSTER_MORPH_DILATE = False         # One light dilation pass for thin walls
+POSTER_MORPH_DILATE_SIZE = 3        # Cross kernel size for dilation
+POSTER_MIN_CLUSTER_CELLS = 4       # Remove connected components smaller than this
+POSTER_CROP_MARGIN_M = 0.3         # Margin around occupied cells when cropping
 # VL53L5CX config
 NUM_SENSORS = 4
 ZONES_PER_SENSOR = 64 # 8x8
@@ -177,6 +190,78 @@ def wrap_deg180(angle_deg):
 
 def nearest_manhattan_axis_deg(angle_deg):
     return 90.0 * round(angle_deg / 90.0)
+
+
+def estimate_alignment_angle_deg(px, py):
+    """Estimate rotation (degrees) to align dominant wall direction with plot axes.
+
+    Builds a histogram of displacement angles (mod 90 deg) between nearby points
+    to find the dominant orientation, then returns the smallest rotation that
+    brings it to the nearest axis.
+    """
+    if len(px) < 50:
+        return 0.0
+
+    rng = np.random.default_rng(42)
+    n = len(px)
+    if n > 4000:
+        idx = rng.choice(n, 4000, replace=False)
+        sx, sy = px[idx].astype(np.float64), py[idx].astype(np.float64)
+    else:
+        sx, sy = np.asarray(px, dtype=np.float64), np.asarray(py, dtype=np.float64)
+    n = len(sx)
+
+    cell = 0.3
+    inv_cell = 1.0 / cell
+    grid = {}
+    for i in range(n):
+        key = (int(math.floor(sx[i] * inv_cell)), int(math.floor(sy[i] * inv_cell)))
+        grid.setdefault(key, []).append(i)
+
+    raw_angles = []
+    min_d2 = 0.05 ** 2
+    max_d2 = 0.50 ** 2
+    for i in range(n):
+        gx = int(math.floor(sx[i] * inv_cell))
+        gy = int(math.floor(sy[i] * inv_cell))
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for j in grid.get((gx + dx, gy + dy), []):
+                    if j <= i:
+                        continue
+                    ddx = sx[j] - sx[i]
+                    ddy = sy[j] - sy[i]
+                    d2 = ddx * ddx + ddy * ddy
+                    if min_d2 < d2 < max_d2:
+                        raw_angles.append(math.degrees(math.atan2(ddy, ddx)) % 90.0)
+
+    if len(raw_angles) < 30:
+        return 0.0
+
+    angles = np.array(raw_angles)
+    n_bins = 90
+    hist, _ = np.histogram(angles, bins=np.linspace(0, 90, n_bins + 1))
+
+    # Circular smoothing
+    k = 3
+    padded = np.concatenate([hist[-k:], hist, hist[:k]])
+    kernel = np.ones(2 * k + 1) / (2 * k + 1)
+    smoothed = np.convolve(padded, kernel, mode='same')[k:-k]
+
+    peak_idx = int(np.argmax(smoothed))
+    peak_angle = peak_idx + 0.5
+
+    if peak_angle > 45.0:
+        return 90.0 - peak_angle
+    else:
+        return -peak_angle
+
+
+def rotate_2d(x, y, angle_deg):
+    """Rotate 2D coordinate arrays by angle_deg (counter-clockwise)."""
+    a = np.radians(angle_deg)
+    c, s = np.cos(a), np.sin(a)
+    return x * c - y * s, x * s + y * c
 
 
 def row_mode_to_indices(row_mode):
@@ -627,14 +712,14 @@ def compute_points(
         if len(px) == 0:
             frame_indices.append(len(all_points_x))
             continue
-        
+
         all_points_x.extend(px)
         all_points_y.extend(py)
         all_sensor_ids.extend(sensor_idx)
-        
+
         frame_indices.append(len(all_points_x))
         count += 1
-        
+
     print(f"Generated {len(all_points_x)} points from {count} frames.")
     return (
         np.array(all_points_x, dtype=np.float32),
@@ -663,9 +748,170 @@ def build_occupancy_raster(points_x, points_y, xlim, ylim, cell_size_m):
         return None, [xlim[0], xlim[1], ylim[0], ylim[1]]
 
     hist, _, _ = np.histogram2d(points_y, points_x, bins=[y_edges, x_edges])
-    raster = np.ma.masked_less_equal(hist.astype(np.float32), 0.0)
+    raster = np.ma.masked_less(hist.astype(np.float32), float(OCCUPANCY_MIN_HIT_THRESHOLD))
     extent = [x_edges[0], x_edges[-1], y_edges[0], y_edges[-1]]
     return raster, extent
+
+
+def load_ground_truth(filepath):
+    """Load ground truth walls from CSV: x1,y1,x2,y2 per line."""
+    walls = []
+    try:
+        with open(filepath, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = [float(x) for x in line.split(',')]
+                if len(parts) >= 4:
+                    walls.append(parts[:4])
+    except Exception as e:
+        print(f"Warning: Could not load ground truth: {e}")
+        return None
+    return walls if walls else None
+
+
+def clean_occupancy_raster(raster):
+    """Morphological cleanup of occupancy raster for poster output.
+
+    Removes isolated cells and tiny clusters, applies closing to bridge
+    short gaps, and optionally dilates thin walls.  Uses square/cross
+    structuring elements to preserve corners.
+    """
+    if raster is None:
+        return None
+    if ndi is None:
+        print("Warning: scipy not available, skipping morphological cleanup.")
+        return raster
+
+    occupied = ~raster.mask
+
+    # 1. Remove small connected components
+    labeled, num_features = ndi.label(occupied)
+    if num_features > 0:
+        component_sizes = ndi.sum(occupied, labeled, range(1, num_features + 1))
+        small_mask = np.zeros_like(occupied)
+        for i, size in enumerate(component_sizes):
+            if size < POSTER_MIN_CLUSTER_CELLS:
+                small_mask |= (labeled == (i + 1))
+        occupied = occupied & ~small_mask
+
+    # 2. Morphological closing (square kernel preserves corners)
+    if POSTER_MORPH_CLOSING_SIZE > 1:
+        struct_close = np.ones(
+            (POSTER_MORPH_CLOSING_SIZE, POSTER_MORPH_CLOSING_SIZE), dtype=bool,
+        )
+        occupied = ndi.binary_closing(occupied, structure=struct_close)
+
+    # 3. Optional light dilation (cross kernel keeps corners sharp)
+    if POSTER_MORPH_DILATE and POSTER_MORPH_DILATE_SIZE > 1:
+        struct_dilate = ndi.generate_binary_structure(2, 1)
+        occupied = ndi.binary_dilation(occupied, structure=struct_dilate)
+
+    # Fill newly-occupied cells with threshold value so they render
+    cleaned_data = raster.data.copy()
+    newly_occupied = occupied & raster.mask
+    cleaned_data[newly_occupied] = float(OCCUPANCY_MIN_HIT_THRESHOLD)
+    return np.ma.array(cleaned_data, mask=~occupied)
+
+
+def windows_explorer_path(path):
+    """Return a Windows-friendly path string when running under WSL."""
+    norm_path = os.path.abspath(path)
+    if norm_path.startswith('/mnt/') and len(norm_path) > 6 and norm_path[5].isalpha():
+        drive = norm_path[5].upper()
+        suffix = norm_path[6:].replace('/', '\\')
+        return f"{drive}:{suffix}"
+
+    distro_name = os.environ.get('WSL_DISTRO_NAME')
+    if distro_name:
+        unc_path = norm_path.replace('/', '\\')
+        return f"\\\\wsl.localhost\\{distro_name}{unc_path}"
+
+    return norm_path
+
+
+def choose_export_directory(default_dir):
+    """Open a folder picker for export destination. Returns None on cancel."""
+    if tk is None:
+        print("tkinter unavailable, exporting to current directory instead.")
+        return default_dir
+
+    root = None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        selected_dir = filedialog.askdirectory(
+            title="Choose Export Folder",
+            initialdir=default_dir,
+            mustexist=True,
+        )
+        return selected_dir or None
+    except Exception as e:
+        print(f"Error opening export folder dialog: {e}")
+        return default_dir
+    finally:
+        if root is not None:
+            root.destroy()
+
+
+def export_poster_images(points_x, points_y, cell_size_m, output_dir, ground_truth_file=None):
+    """Export raw and cleaned occupancy maps as poster-ready PNGs."""
+    if len(points_x) == 0:
+        print("No points to export.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    margin = POSTER_CROP_MARGIN_M
+    xlim = (float(np.min(points_x)) - margin, float(np.max(points_x)) + margin)
+    ylim = (float(np.min(points_y)) - margin, float(np.max(points_y)) + margin)
+
+    raw_raster, extent = build_occupancy_raster(points_x, points_y, xlim, ylim, cell_size_m)
+    if raw_raster is None:
+        print("No occupancy data to export.")
+        return
+
+    cleaned_raster = clean_occupancy_raster(raw_raster)
+
+    gt_walls = None
+    if ground_truth_file:
+        gt_walls = load_ground_truth(ground_truth_file)
+
+    cmap = plt.cm.Greys.copy()
+    cmap.set_bad(alpha=0.0)
+
+    for label, raster in [('raw', raw_raster), ('cleaned', cleaned_raster)]:
+        fig_e, ax_e = plt.subplots(figsize=(10, 10))
+        ax_e.imshow(
+            raster,
+            extent=extent,
+            origin='lower',
+            cmap=cmap,
+            interpolation='nearest',
+            alpha=1.0,
+            vmin=float(OCCUPANCY_MIN_HIT_THRESHOLD),
+            vmax=OCCUPANCY_SATURATION_HITS,
+        )
+        if gt_walls is not None:
+            for wall in gt_walls:
+                ax_e.plot(
+                    [wall[0], wall[2]], [wall[1], wall[3]],
+                    color='tab:red', linewidth=0.8, alpha=0.7,
+                )
+        ax_e.set_aspect('equal')
+        ax_e.set_xlim(xlim)
+        ax_e.set_ylim(ylim)
+        ax_e.set_xlabel('X (m)')
+        ax_e.set_ylabel('Y (m)')
+        ax_e.grid(False)
+        fig_e.tight_layout()
+        fname = os.path.join(output_dir, f'occupancy_{label}.png')
+        fig_e.savefig(fname, dpi=300, bbox_inches='tight')
+        print(f"Saved {fname}")
+        explorer_fname = windows_explorer_path(fname)
+        if explorer_fname != fname:
+            print(f"Windows path: {explorer_fname}")
+        plt.close(fig_e)
 
 
 def build_trajectory_arrays(records, filter_profile):
@@ -786,9 +1032,10 @@ def plot_data(
     frame_indices,
     records,
     single_frame_only=False,
-    use_manhattan_yaw=False,
-    use_3d_ray_rotation=True,
     use_startup_filter=True,
+    ground_truth_file=None,
+    room_size=None,
+    room_offset=(0.0, 0.0),
 ):
     if len(records) == 0:
         print("No records to plot.")
@@ -803,13 +1050,21 @@ def plot_data(
     session_summary = compute_session_summary(records, filter_profile)
     view_state = {
         'single_frame_only': single_frame_only,
-        'use_manhattan_yaw': use_manhattan_yaw,
-        'use_3d_ray_rotation': use_3d_ray_rotation,
+        'use_manhattan_yaw': False,
+        'use_3d_ray_rotation': True,
         'filter_aggressiveness': DEFAULT_FILTER_AGGRESSIVENESS,
         'render_mode': 'points',
         'occupancy_cell_size_m': OCCUPANCY_CELL_SIZE_M,
         'row_mode': DEFAULT_ROW_MODE,
         'use_startup_filter': use_startup_filter,
+        'poster_mode': False,
+        'show_summary': True,
+        'show_trajectory': True,
+        'show_legend': True,
+        'align_to_axis': False,
+        'alignment_angle_deg': 0.0,
+        'show_drone': True,
+        'color_by_sensor': True,
     }
     point_state = {
         'x': points_x,
@@ -820,10 +1075,7 @@ def plot_data(
         'traj_y': traj_y_all,
         'session_summary': session_summary,
     }
-    
-    # Initial plot: all points shown initially? Or starts empty?
-    # User asked for "gradual addition", maybe start with 10% or just 0.
-    
+
     sensor_scatters = {}
     for sensor_idx, (sensor_name, sensor_color) in enumerate(zip(SENSOR_NAMES, SENSOR_COLORS)):
         if not ENABLED_SENSOR_MASK[sensor_idx]:
@@ -831,7 +1083,9 @@ def plot_data(
         sensor_scatters[sensor_idx] = ax.scatter(
             [], [], s=3, c=sensor_color, alpha=0.55, label=sensor_name
         )
-    occupancy_cmap = plt.cm.hot.copy()
+    mono_scatter = ax.scatter([], [], s=3, c='black', alpha=0.55, label='_nolegend_')
+    mono_scatter.set_visible(False)
+    occupancy_cmap = plt.cm.Greys.copy()
     occupancy_cmap.set_bad(alpha=0.0)
     occupancy_img = ax.imshow(
         np.ma.masked_all((2, 2), dtype=np.float32),
@@ -839,7 +1093,7 @@ def plot_data(
         origin='lower',
         cmap=occupancy_cmap,
         interpolation='nearest',
-        alpha=0.90,
+        alpha=1.0,
         visible=False,
         zorder=1,
     )
@@ -850,12 +1104,42 @@ def plot_data(
         arrowprops=dict(arrowstyle='->', color='magenta', lw=2.5, mutation_scale=15),
         zorder=11,
     )
-    
+
+    # Ground truth overlay (static, drawn once)
+    if ground_truth_file:
+        gt_walls = load_ground_truth(ground_truth_file)
+        if gt_walls:
+            for wall in gt_walls:
+                ax.plot(
+                    [wall[0], wall[2]], [wall[1], wall[3]],
+                    color='tab:red', linewidth=0.8, alpha=0.7, zorder=5,
+                )
+
+    # Room boundary overlay (drawn as a closed line so rotation works)
+    room_line = None
+    room_corners_xy = None
+    if room_size is not None:
+        rw, rl = room_size
+        ox, oy = room_offset
+        room_corners_xy = np.array([
+            [ox - rw / 2, oy - rl / 2],
+            [ox + rw / 2, oy - rl / 2],
+            [ox + rw / 2, oy + rl / 2],
+            [ox - rw / 2, oy + rl / 2],
+            [ox - rw / 2, oy - rl / 2],  # close the rectangle
+        ], dtype=np.float64)
+        room_line, = ax.plot(
+            room_corners_xy[:, 0], room_corners_xy[:, 1],
+            color='tab:cyan', linewidth=2.0, linestyle='--',
+            alpha=0.85, zorder=6, label='Room',
+        )
+    view_state['show_room'] = room_line is not None
+
     ax.set_aspect('equal')
     ax.grid(True)
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
-    ax.legend()
+    legend = ax.legend()
     title = ax.set_title("")
     summary_text = ax.text(
         0.015,
@@ -867,23 +1151,44 @@ def plot_data(
         fontsize=9,
         bbox={'facecolor': 'white', 'alpha': 0.85, 'edgecolor': '0.7'},
     )
-    
+    ax_summary_toggle = plt.axes([0.02, 0.92, 0.085, 0.04])
+    btn_summary_toggle = Button(ax_summary_toggle, 'Sum On')
+    btn_summary_toggle.label.set_fontsize(8)
+    ax_traj_toggle = plt.axes([0.11, 0.92, 0.09, 0.04])
+    btn_traj_toggle = Button(ax_traj_toggle, 'Traj On')
+    btn_traj_toggle.label.set_fontsize(8)
+    ax_legend_toggle = plt.axes([0.205, 0.92, 0.095, 0.04])
+    btn_legend_toggle = Button(ax_legend_toggle, 'Legend On')
+    btn_legend_toggle.label.set_fontsize(8)
+    ax_align = plt.axes([0.305, 0.92, 0.095, 0.04])
+    btn_align = Button(ax_align, 'Align: Off')
+    btn_align.label.set_fontsize(8)
+    ax_drone_toggle = plt.axes([0.405, 0.92, 0.095, 0.04])
+    btn_drone_toggle = Button(ax_drone_toggle, 'Drone On')
+    btn_drone_toggle.label.set_fontsize(8)
+    ax_color_toggle = plt.axes([0.505, 0.92, 0.095, 0.04])
+    btn_color_toggle = Button(ax_color_toggle, 'Color On')
+    btn_color_toggle.label.set_fontsize(8)
+    ax_room_toggle = plt.axes([0.605, 0.92, 0.095, 0.04])
+    btn_room_toggle = Button(ax_room_toggle, 'Room On' if room_patch else 'Room Off')
+    btn_room_toggle.label.set_fontsize(8)
+
     # Calculate bounds
     if len(points_x) > 0:
         full_x = [r['x'] for r in records]
         full_y = [r['y'] for r in records]
-        
-        # Use trajectory bounds to start, expanded slightly
+
         min_x, max_x = min(full_x), max(full_x)
         min_y, max_y = min(full_y), max(full_y)
-        
-        # Expand for points (points go out 4m)
+
         margin = 4.0
         ax.set_xlim(min_x - margin, max_x + margin)
         ax.set_ylim(min_y - margin, max_y + margin)
     else:
         ax.set_xlim(-5, 5)
         ax.set_ylim(-5, 5)
+    view_state['normal_xlim'] = ax.get_xlim()
+    view_state['normal_ylim'] = ax.get_ylim()
 
     # Sliders and buttons
     axcolor = 'lightgoldenrodyellow'
@@ -920,18 +1225,12 @@ def plot_data(
     # Row 3: buttons + filter slider
     ax_toggle = plt.axes([0.02, 0.22, 0.16, 0.05])
     btn_toggle = Button(ax_toggle, 'View: Frame' if single_frame_only else 'View: Accum')
-    ax_manhattan = plt.axes([0.02, 0.10, 0.16, 0.05])
-    btn_manhattan = Button(
-        ax_manhattan,
-        'Manhattan: On' if use_manhattan_yaw else 'Manhattan: Off',
-    )
+    ax_poster = plt.axes([0.02, 0.10, 0.16, 0.05])
+    btn_poster = Button(ax_poster, 'Poster: Off')
     ax_rows = plt.axes([0.02, 0.03, 0.16, 0.05])
     btn_rows = Button(ax_rows, f'Rows: {row_mode_label(DEFAULT_ROW_MODE)}')
-    ax_ray = plt.axes([0.25, 0.10, 0.16, 0.05])
-    btn_ray = Button(
-        ax_ray,
-        '3D Rays: On' if use_3d_ray_rotation else '3D Rays: Off',
-    )
+    ax_export = plt.axes([0.25, 0.10, 0.16, 0.05])
+    btn_export = Button(ax_export, 'Export PNGs')
     ax_render = plt.axes([0.25, 0.03, 0.16, 0.05])
     btn_render = Button(ax_render, 'Render: Points')
     ax_startup = plt.axes([0.48, 0.03, 0.18, 0.05])
@@ -953,6 +1252,7 @@ def plot_data(
     
     def update(val):
         frame_idx = int(s_time.val)
+        is_poster = view_state.get('poster_mode', False)
 
         if view_state['single_frame_only']:
             start_pt_idx, end_pt_idx = frame_points_slice(point_state['frame_indices'], frame_idx)
@@ -966,20 +1266,45 @@ def plot_data(
         current_y = point_state['y'][start_pt_idx:end_pt_idx]
         current_sensor_ids = point_state['sensor_ids'][start_pt_idx:end_pt_idx]
 
-        if view_state['render_mode'] == 'grid':
+        if view_state['align_to_axis'] and view_state['alignment_angle_deg'] != 0.0:
+            current_x, current_y = rotate_2d(current_x, current_y, view_state['alignment_angle_deg'])
+
+        # Update room overlay with current rotation
+        if room_line is not None and room_corners_xy is not None and view_state['show_room']:
+            if view_state['align_to_axis'] and view_state['alignment_angle_deg'] != 0.0:
+                rx, ry = rotate_2d(room_corners_xy[:, 0], room_corners_xy[:, 1],
+                                   view_state['alignment_angle_deg'])
+                room_line.set_data(rx, ry)
+            else:
+                room_line.set_data(room_corners_xy[:, 0], room_corners_xy[:, 1])
+
+        show_grid = view_state['render_mode'] == 'grid' or is_poster
+
+        if show_grid:
+            if is_poster and len(current_x) > 0:
+                p_margin = POSTER_CROP_MARGIN_M
+                grid_xlim = (float(np.min(current_x)) - p_margin,
+                             float(np.max(current_x)) + p_margin)
+                grid_ylim = (float(np.min(current_y)) - p_margin,
+                             float(np.max(current_y)) + p_margin)
+            else:
+                grid_xlim = ax.get_xlim()
+                grid_ylim = ax.get_ylim()
             raster, extent = build_occupancy_raster(
                 current_x,
                 current_y,
-                ax.get_xlim(),
-                ax.get_ylim(),
+                grid_xlim,
+                grid_ylim,
                 view_state['occupancy_cell_size_m'],
             )
+            if is_poster and raster is not None:
+                raster = clean_occupancy_raster(raster)
             if raster is None:
                 occupancy_img.set_data(np.ma.masked_all((2, 2), dtype=np.float32))
             else:
                 occupancy_img.set_data(raster)
                 occupancy_img.set_extent(extent)
-                occupancy_img.set_clim(vmin=1.0, vmax=OCCUPANCY_SATURATION_HITS)
+                occupancy_img.set_clim(vmin=float(OCCUPANCY_MIN_HIT_THRESHOLD), vmax=OCCUPANCY_SATURATION_HITS)
             occupancy_img.set_visible(True)
         else:
             occupancy_img.set_visible(False)
@@ -990,9 +1315,10 @@ def plot_data(
             current_sensor_ids,
             MAX_DISPLAY_POINTS,
         )
-        
+
+        use_color = view_state['color_by_sensor']
         for sensor_idx, scatter in sensor_scatters.items():
-            if view_state['render_mode'] == 'grid':
+            if show_grid or not use_color:
                 scatter.set_offsets(np.empty((0, 2)))
                 continue
             if len(disp_x) == 0:
@@ -1004,7 +1330,14 @@ def plot_data(
                 scatter.set_offsets(np.c_[disp_x[sensor_mask], disp_y[sensor_mask]])
             else:
                 scatter.set_offsets(np.empty((0, 2)))
-            
+
+        if not use_color and not show_grid and len(disp_x) > 0:
+            mono_scatter.set_offsets(np.c_[disp_x, disp_y])
+            mono_scatter.set_visible(True)
+        else:
+            mono_scatter.set_offsets(np.empty((0, 2)))
+            mono_scatter.set_visible(False)
+
         # Update Trajectory
         if view_state['single_frame_only']:
             traj_start = 0
@@ -1020,42 +1353,76 @@ def plot_data(
             np.zeros(len(traj_x), dtype=np.uint8),
             MAX_TRAJECTORY_POINTS,
         )
+        if view_state['align_to_axis'] and view_state['alignment_angle_deg'] != 0.0:
+            traj_disp_x, traj_disp_y = rotate_2d(traj_disp_x, traj_disp_y, view_state['alignment_angle_deg'])
         trajectory.set_data(traj_disp_x, traj_disp_y)
-        
+
         # Update Drone Pos + heading arrow
         if view_state['single_frame_only']:
             drec = records[frame_idx]
         else:
             drec = records[int(s_range_end.val)]
         dx, dy = drec['x'], drec['y']
-        drone_marker.set_data([dx], [dy])
         yaw_rad = math.radians(drec['yaw'])
+        if view_state['align_to_axis'] and view_state['alignment_angle_deg'] != 0.0:
+            a_rad = math.radians(view_state['alignment_angle_deg'])
+            c, s = math.cos(a_rad), math.sin(a_rad)
+            dx, dy = dx * c - dy * s, dx * s + dy * c
+            yaw_rad += a_rad
+        drone_marker.set_data([dx], [dy])
         heading_arrow.xy = (dx + 0.6 * math.cos(yaw_rad), dy + 0.6 * math.sin(yaw_rad))
         heading_arrow.set_position((dx, dy))
-        if view_state['single_frame_only']:
-            mode_label = f"Frame {frame_idx + 1}/{len(records)}"
+
+        # Poster mode: hide debug clutter, crop tight
+        trajectory.set_visible(view_state['show_trajectory'] and not is_poster)
+        drone_marker.set_visible(view_state['show_drone'] and not is_poster)
+        heading_arrow.set_visible(view_state['show_drone'] and not is_poster)
+        summary_text.set_visible(view_state['show_summary'] and not is_poster)
+        if legend is not None:
+            legend.set_visible(view_state['show_legend'] and not is_poster)
+
+        if is_poster:
+            ax.grid(False)
+            ax.set_xlabel('')
+            ax.set_ylabel('')
+            ax.tick_params(labelbottom=False, labelleft=False, bottom=False, left=False)
+            if len(current_x) > 0:
+                p_margin = POSTER_CROP_MARGIN_M
+                ax.set_xlim(float(np.min(current_x)) - p_margin,
+                            float(np.max(current_x)) + p_margin)
+                ax.set_ylim(float(np.min(current_y)) - p_margin,
+                            float(np.max(current_y)) + p_margin)
+            title.set_text('')
         else:
-            mode_label = f"Accum [{int(s_range_start.val)}–{int(s_range_end.val)}]"
-        title.set_text(
-            f"{mode_label} | Render {'Grid' if view_state['render_mode'] == 'grid' else 'Points'} | "
-            f"Rows {row_mode_label(view_state['row_mode'])} | "
-            f"Manhattan {'On' if view_state['use_manhattan_yaw'] else 'Off'} | "
-            f"3D Rays {'On' if view_state['use_3d_ray_rotation'] else 'Off'} | "
-            f"Startup {'On' if view_state['use_startup_filter'] else 'Off'} | "
-            f"Filter {view_state['filter_aggressiveness']:.2f} | "
-            f"Cell {view_state['occupancy_cell_size_m']:.2f}m | "
-            f"Valid Frames {point_state['session_summary']['valid_count']}/{len(records)} | "
-            f"Points shown {len(disp_x):,}/{len(current_x):,}"
-        )
-        summary_text.set_text(
-            "Session Summary\n"
-            f"Flight: {point_state['session_summary']['duration_s']:.1f}s\n"
-            f"Armed: {point_state['session_summary']['armed_s']:.1f}s\n"
-            f"Avg OF q: {point_state['session_summary']['avg_of_q']:.1f}\n"
-            f"Valid: {point_state['session_summary']['valid_pct']:.1f}%\n"
-            f"Avg speed: {point_state['session_summary']['avg_speed_mps']:.2f} m/s"
-        )
-        
+            ax.grid(True)
+            ax.set_xlabel('X (m)')
+            ax.set_ylabel('Y (m)')
+            ax.tick_params(labelbottom=True, labelleft=True, bottom=True, left=True)
+            if 'normal_xlim' in view_state:
+                ax.set_xlim(view_state['normal_xlim'])
+                ax.set_ylim(view_state['normal_ylim'])
+            if view_state['single_frame_only']:
+                mode_label = f"Frame {frame_idx + 1}/{len(records)}"
+            else:
+                mode_label = f"Accum [{int(s_range_start.val)}\u2013{int(s_range_end.val)}]"
+            title.set_text(
+                f"{mode_label} | "
+                f"Rows {row_mode_label(view_state['row_mode'])} | "
+                f"Startup {'On' if view_state['use_startup_filter'] else 'Off'} | "
+                f"Filter {view_state['filter_aggressiveness']:.2f} | "
+                f"Cell {view_state['occupancy_cell_size_m']:.2f}m | "
+                f"Valid {point_state['session_summary']['valid_count']}/{len(records)} | "
+                f"Pts {len(disp_x):,}/{len(current_x):,}"
+            )
+            summary_text.set_text(
+                "Session Summary\n"
+                f"Flight: {point_state['session_summary']['duration_s']:.1f}s\n"
+                f"Armed: {point_state['session_summary']['armed_s']:.1f}s\n"
+                f"Avg OF q: {point_state['session_summary']['avg_of_q']:.1f}\n"
+                f"Valid: {point_state['session_summary']['valid_pct']:.1f}%\n"
+                f"Avg speed: {point_state['session_summary']['avg_speed_mps']:.2f} m/s"
+            )
+
         fig.canvas.draw_idle()
 
     def toggle_view(_event):
@@ -1088,21 +1455,108 @@ def plot_data(
         point_state['frame_indices'] = new_frame_indices
         point_state['traj_x'], point_state['traj_y'] = build_trajectory_arrays(records, profile)
         point_state['session_summary'] = compute_session_summary(records, profile)
+        if view_state['align_to_axis']:
+            view_state['alignment_angle_deg'] = estimate_alignment_angle_deg(new_x, new_y)
+            fx, fy = rotate_2d(
+                np.array([r['x'] for r in records], dtype=np.float32),
+                np.array([r['y'] for r in records], dtype=np.float32),
+                view_state['alignment_angle_deg'],
+            )
+            margin = 4.0
+            view_state['normal_xlim'] = (float(np.min(fx)) - margin, float(np.max(fx)) + margin)
+            view_state['normal_ylim'] = (float(np.min(fy)) - margin, float(np.max(fy)) + margin)
         update(s_time.val)
 
-    def toggle_manhattan(_event):
-        view_state['use_manhattan_yaw'] = not view_state['use_manhattan_yaw']
-        btn_manhattan.label.set_text(
-            'Manhattan: On' if view_state['use_manhattan_yaw'] else 'Manhattan: Off'
+    def toggle_poster(_event):
+        view_state['poster_mode'] = not view_state['poster_mode']
+        btn_poster.label.set_text(
+            'Poster: On' if view_state['poster_mode'] else 'Poster: Off'
         )
-        rebuild_projection()
+        update(s_time.val)
 
-    def toggle_ray_mode(_event):
-        view_state['use_3d_ray_rotation'] = not view_state['use_3d_ray_rotation']
-        btn_ray.label.set_text(
-            '3D Rays: On' if view_state['use_3d_ray_rotation'] else '3D Rays: Off'
+    def toggle_summary(_event):
+        view_state['show_summary'] = not view_state['show_summary']
+        btn_summary_toggle.label.set_text(
+            'Sum On' if view_state['show_summary'] else 'Sum Off'
         )
-        rebuild_projection()
+        update(s_time.val)
+
+    def toggle_trajectory(_event):
+        view_state['show_trajectory'] = not view_state['show_trajectory']
+        btn_traj_toggle.label.set_text(
+            'Traj On' if view_state['show_trajectory'] else 'Traj Off'
+        )
+        update(s_time.val)
+
+    def toggle_legend(_event):
+        view_state['show_legend'] = not view_state['show_legend']
+        btn_legend_toggle.label.set_text(
+            'Legend On' if view_state['show_legend'] else 'Legend Off'
+        )
+        update(s_time.val)
+
+    def toggle_align(_event):
+        view_state['align_to_axis'] = not view_state['align_to_axis']
+        if view_state['align_to_axis']:
+            angle = estimate_alignment_angle_deg(point_state['x'], point_state['y'])
+            view_state['alignment_angle_deg'] = angle
+            print(f"Axis alignment: {angle:.1f} deg")
+        btn_align.label.set_text(
+            'Align: On' if view_state['align_to_axis'] else 'Align: Off'
+        )
+        # Recompute view limits for rotated/unrotated coordinates
+        if len(point_state['x']) > 0:
+            fx = np.array([r['x'] for r in records], dtype=np.float32)
+            fy = np.array([r['y'] for r in records], dtype=np.float32)
+            if view_state['align_to_axis'] and view_state['alignment_angle_deg'] != 0.0:
+                fx, fy = rotate_2d(fx, fy, view_state['alignment_angle_deg'])
+            margin = 4.0
+            view_state['normal_xlim'] = (float(np.min(fx)) - margin, float(np.max(fx)) + margin)
+            view_state['normal_ylim'] = (float(np.min(fy)) - margin, float(np.max(fy)) + margin)
+        update(s_time.val)
+
+    def toggle_drone(_event):
+        view_state['show_drone'] = not view_state['show_drone']
+        btn_drone_toggle.label.set_text(
+            'Drone On' if view_state['show_drone'] else 'Drone Off'
+        )
+        update(s_time.val)
+
+    def toggle_color(_event):
+        view_state['color_by_sensor'] = not view_state['color_by_sensor']
+        btn_color_toggle.label.set_text(
+            'Color On' if view_state['color_by_sensor'] else 'Color Off'
+        )
+        update(s_time.val)
+
+    def toggle_room(_event):
+        if room_line is None:
+            return
+        view_state['show_room'] = not view_state['show_room']
+        room_line.set_visible(view_state['show_room'])
+        btn_room_toggle.label.set_text(
+            'Room On' if view_state['show_room'] else 'Room Off'
+        )
+        fig.canvas.draw_idle()
+
+    def do_export_poster(_event):
+        range_start = int(s_range_start.val)
+        range_end = int(s_range_end.val)
+        start_pt_idx = point_state['frame_indices'][range_start]
+        end_pt_idx = point_state['frame_indices'][min(range_end + 1, len(records))]
+        export_x = point_state['x'][start_pt_idx:end_pt_idx]
+        export_y = point_state['y'][start_pt_idx:end_pt_idx]
+        default_export_dir = os.path.dirname(os.path.abspath(__file__))
+        output_dir = choose_export_directory(default_export_dir)
+        if not output_dir:
+            print("Export canceled.")
+            return
+        export_poster_images(
+            export_x, export_y,
+            view_state['occupancy_cell_size_m'],
+            output_dir,
+            ground_truth_file=ground_truth_file,
+        )
 
     def toggle_render_mode(_event):
         view_state['render_mode'] = 'grid' if view_state['render_mode'] == 'points' else 'points'
@@ -1135,10 +1589,17 @@ def plot_data(
     s_time.on_changed(update)
     s_range_start.on_changed(update)
     s_range_end.on_changed(update)
+    btn_summary_toggle.on_clicked(toggle_summary)
+    btn_traj_toggle.on_clicked(toggle_trajectory)
+    btn_legend_toggle.on_clicked(toggle_legend)
+    btn_align.on_clicked(toggle_align)
+    btn_drone_toggle.on_clicked(toggle_drone)
+    btn_color_toggle.on_clicked(toggle_color)
+    btn_room_toggle.on_clicked(toggle_room)
     btn_toggle.on_clicked(toggle_view)
-    btn_manhattan.on_clicked(toggle_manhattan)
+    btn_poster.on_clicked(toggle_poster)
     btn_rows.on_clicked(toggle_row_mode)
-    btn_ray.on_clicked(toggle_ray_mode)
+    btn_export.on_clicked(do_export_poster)
     btn_startup.on_clicked(toggle_startup_filter)
     btn_render.on_clicked(toggle_render_mode)
     s_filter.on_changed(update_filter_aggressiveness)
@@ -1154,11 +1615,32 @@ if __name__ == "__main__":
         help="Show only the current frame's points instead of the accumulated map",
     )
     parser.add_argument(
-        "--manhattan-yaw",
-        action="store_true",
-        help="Apply per-frame Manhattan yaw correction before projection",
+        "--ground-truth",
+        default=None,
+        help="CSV file with ground truth walls (x1,y1,x2,y2 per line)",
+    )
+    parser.add_argument(
+        "--room",
+        default=None,
+        help="Room boundary as WxL in metres (e.g. '1.8x2.7'). Draws a rectangle overlay.",
+    )
+    parser.add_argument(
+        "--room-offset",
+        default=None,
+        help="Room centre offset as X,Y in metres (e.g. '0.5,0.3'). Default: 0,0.",
     )
     args = parser.parse_args()
+
+    room_size = None
+    room_offset = (0.0, 0.0)
+    if args.room:
+        parts = args.room.split('x')
+        if len(parts) >= 2:
+            room_size = (float(parts[0]), float(parts[1]))
+    if args.room_offset:
+        parts = args.room_offset.split(',')
+        if len(parts) >= 2:
+            room_offset = (float(parts[0]), float(parts[1]))
 
     filename = args.logfile
 
@@ -1166,7 +1648,7 @@ if __name__ == "__main__":
     if not filename and tk is not None:
         try:
             root = tk.Tk()
-            root.withdraw() # Hide the main window
+            root.withdraw()
             filename = filedialog.askopenfilename(
                 title="Select Scan Log",
                 filetypes=(("Binary Log", "*.bin"), ("All files", "*.*"))
@@ -1174,11 +1656,11 @@ if __name__ == "__main__":
             root.destroy()
         except Exception as e:
             print(f"Error opening file dialog: {e}")
-    
+
     if not filename:
         print("No file selected.")
         sys.exit(0)
-    
+
     try:
         recs = parse_log(filename)
         if not recs:
@@ -1200,11 +1682,11 @@ if __name__ == "__main__":
             f"avg_speed={session_summary['avg_speed_mps']:.2f}m/s | "
             f"filter={DEFAULT_FILTER_AGGRESSIVENESS:.2f}"
         )
-            
+
         px, py, sensor_ids, idxs, recs = rebuild_points(
             recs,
             DEFAULT_COLUMN_AZ_OFFSETS_DEG,
-            use_manhattan_yaw=args.manhattan_yaw,
+            use_manhattan_yaw=False,
             use_3d_ray_rotation=True,
             filter_profile=default_filter_profile,
             row_filter_indices=row_mode_to_indices(DEFAULT_ROW_MODE),
@@ -1216,10 +1698,11 @@ if __name__ == "__main__":
             idxs,
             recs,
             single_frame_only=args.single_frame,
-            use_manhattan_yaw=args.manhattan_yaw,
-            use_3d_ray_rotation=True,
+            ground_truth_file=args.ground_truth,
+            room_size=room_size,
+            room_offset=room_offset,
         )
-        
+
     except FileNotFoundError:
         print(f"Error: File {filename} not found.")
         print("Usage: python plot_scan.py [path/to/scanlog.bin]")

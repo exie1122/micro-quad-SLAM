@@ -8,7 +8,7 @@ The system combines optical flow velocity estimation, time-of-flight (ToF) depth
 
 The goal is to explore whether a highly constrained nano-quadcopter platform can support GPS-denied navigation and mapping for applications such as search-and-rescue, structural inspection, and confined-space exploration.
 
-![Drone (older version)](drone%20photo.png)
+![Drone (older version)](assets/drone%20photo.png)
 *Figure: Earlier prototype of the nano-quadcopter platform; hardware has since been updated.*
 
 ---
@@ -122,21 +122,29 @@ Key observations:
 
 ## Mapped Environment
 
-![Autonomously mapped environment](Figure_1.png)
-![Autonomously mapped environment](image%20(9).png)
+![Autonomously mapped environment](assets/Figure_1.png)
+![Autonomously mapped environment](assets/image%20(9).png)
 
 ---
 
 ## Repository Structure
 
-- `README.md` — project overview, hardware versions, tuning notes, and results
-- `clean_uav_fc_tof_nav.c` — autonomous flight and navigation code
-- `manual_uav_fc_tof_nav.c` — manual flight controller version with logging
-- `uav_local_nav.c` — local navigation logic
-- `plot_scan.py` — mapping / scan visualization script
-- `tof_esp32.ino` — ESP32 sensor hub firmware
-- `m5stack_armDisarm.ino` — M5Stack arm/disarm helper
-- `image (9).png` — example mapped environment output
+- `c/` — flight control and navigation code
+- `python/` — scan parsing and visualization tools
+- `arduino/` — ESP32 / helper firmware
+- `assets/` — images and documentation figures
+
+Key files:
+
+- `c/clean_uav_fc_tof_nav.c` — autonomous flight and navigation code
+- `c/manual_uav_fc_tof_nav.c` — manual flight controller version with logging
+- `c/uav_local_nav.c` — local navigation logic
+- `c/frontier.c` — frontier exploration / navigation work
+- `python/plot_scan.py` — 2D mapping / scan visualization script
+- `python/plot_scan_3d.py` — 3D point-cloud viewer and room-alignment tool
+- `arduino/tof_esp32.ino` — ESP32 sensor hub firmware
+- `arduino/m5stack_armDisarm.ino` — M5Stack arm/disarm helper
+- `assets/image (9).png` — example mapped environment output
 
 ---
 
@@ -148,4 +156,4 @@ Key observations:
 riscv64-linux-gnu-gcc -Os -std=gnu11 -w -static \
   -ffunction-sections -fdata-sections -Wl,--gc-sections \
   -I"$HOME/c_library_v2" \
-  clean_uav_fc_tof_nav.c -o uav_fc_tof_nav_riscv_static -lm
+  c/clean_uav_fc_tof_nav.c -o uav_fc_tof_nav_riscv_static -lm

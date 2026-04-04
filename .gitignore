@@ -1,0 +1,38 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Local scan logs and exports
+*.bin
+*_scanlog*.bin
+*_log.txt
+session_*.txt
+session_*.log.txt
+*_frames_*.json
+*.room.json
+logs/
+pngs/
+result/
+calib_images/
+
+# Local build / generated artifacts
+*.o
+*.out
+*.elf
+*.map
+*.a
+*.so
+*_riscv_static
+
+# Model/export artifacts
+*.onnx
+*.mlir
+*.npz
+*.prototxt
+yolov8n*
+final_opt.onnx
+_weight_map.csv
+
+# Editor / OS clutter
+.DS_Store
+Thumbs.db
