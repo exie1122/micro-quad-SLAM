@@ -1,0 +1,108 @@
+"""
+Stage 3 - convert.
+
+ONNX -> INT8 .cvimodel via TPU-MLIR (cv181x), calibrating on REAL held-out frames
+(not synthetic). Also runs the FP32 ONNX over the test sequence(s) so we can later
+report the INT8-vs-FP32 accuracy delta in degrees.
+
+Outputs in <workdir>:
+  yaw_net.mlir, yaw_net_cali_table, yaw_net_int8.cvimodel
+  fp32_pred_<seq>.npz   (FP32 predicted angles per pair, for the delta)
+"""
+import os
+import json
+import argparse
+import subprocess
+import numpy as np
+import cv2
+
+from config_util import load_config, ensure_workdir
+
+
+def _load_pair(p, size):
+    def g(path):
+        im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if im.shape != (size, size):
+            im = cv2.resize(im, (size, size), interpolation=cv2.INTER_AREA)
+        return im.astype(np.float32) / 255.0
+    return np.stack([g(p["img_a"]), g(p["img_b"])], 0)[None]   # [1,2,H,W]
+
+
+def run(cmd, cwd):
+    print("  $", " ".join(cmd))
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(r.stdout[-2000:]); print(r.stderr[-2000:])
+        raise SystemExit(f"[convert] command failed (rc={r.returncode}): {' '.join(cmd)}")
+    return r
+
+
+def make_calib(manifest, workdir, n, size):
+    """Write n real held-out (test) frame-pair tensors as npz + a data_list."""
+    test_seq = manifest["splits"]["test"][0]
+    pairs = manifest["sequences"][test_seq]
+    sel = np.linspace(0, len(pairs) - 1, n).astype(int)
+    cdir = os.path.join(workdir, "calib")
+    os.makedirs(cdir, exist_ok=True)
+    lines = []
+    for i, j in enumerate(sel):
+        x = _load_pair(pairs[j], size).astype(np.float32)
+        fp = os.path.join(cdir, f"calib_{i:03d}.npz")
+        np.savez(fp, input=x)
+        lines.append(fp)
+    listf = os.path.join(workdir, "calib_list.txt")
+    open(listf, "w").write("\n".join(lines) + "\n")
+    print(f"[convert] {n} REAL calibration tensors from held-out '{test_seq}'")
+    return listf
+
+
+def fp32_predict(manifest, workdir, size):
+    import onnxruntime as ort
+    sess = ort.InferenceSession(os.path.join(workdir, "yaw_net.onnx"),
+                                providers=["CPUExecutionProvider"])
+    for seq in manifest["splits"]["test"]:
+        pairs = manifest["sequences"][seq]
+        angles = []
+        for p in pairs:
+            out = sess.run(None, {"input": _load_pair(p, size)})[0][0]
+            out = out / (np.linalg.norm(out) + 1e-9)
+            angles.append(float(np.arctan2(out[0], out[1])))
+        np.savez(os.path.join(workdir, f"fp32_pred_{seq}.npz"), angle=np.array(angles))
+        print(f"[convert] FP32 predictions for {seq}: {len(angles)} pairs")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yaml")
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+    workdir = ensure_workdir(cfg)
+    manifest = json.load(open(os.path.join(workdir, "manifest.json")))
+    size = manifest["img_size"]
+    chip = cfg["convert"]["chip"]
+
+    listf = make_calib(manifest, workdir, cfg["convert"]["calib_frames"], size)
+
+    print("[convert] model_transform ...")
+    run(["model_transform.py", "--model_name", "yaw_net",
+         "--model_def", "yaw_net.onnx",
+         "--input_shapes", "[[1,2,128,128]]",
+         "--mlir", "yaw_net.mlir"], cwd=workdir)
+
+    print("[convert] run_calibration ...")
+    run(["run_calibration.py", "yaw_net.mlir",
+         "--data_list", os.path.basename(listf),
+         "--input_num", str(cfg["convert"]["calib_frames"]),
+         "-o", "yaw_net_cali_table"], cwd=workdir)
+
+    print(f"[convert] model_deploy (INT8, {chip}) ...")
+    run(["model_deploy.py", "--mlir", "yaw_net.mlir",
+         "--quantize", "INT8", "--calibration_table", "yaw_net_cali_table",
+         "--chip", chip, "--model", "yaw_net_int8.cvimodel"], cwd=workdir)
+
+    fp32_predict(manifest, workdir, size)
+    print(f"[convert] DONE -> {os.path.join(workdir, 'yaw_net_int8.cvimodel')}")
+
+
+if __name__ == "__main__":
+    main()
