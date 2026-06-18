@@ -1,0 +1,57 @@
+# Conservative robustness experiment: retain the deployed input geometry and
+# add zero-motion/photometric examples aimed at real-camera stationary bias.
+run_label: "TUM robustness experiment - baseline geometry plus zero-motion augmentation"
+
+dataset:
+  adapter: tum
+  cache_dir: /home/ethan/.cache/yaw_pipeline/tum
+  img_size: 128
+  resize_mode: stretch
+  frame_stride: 4
+  gyro_bias_deg_s: 0.8
+  gyro_noise_deg_s: 0.15
+  sequences:
+    train:
+      - rgbd_dataset_freiburg1_desk
+      - rgbd_dataset_freiburg1_rpy
+    test:
+      - rgbd_dataset_freiburg1_360
+
+train:
+  epochs: 50
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0001
+  val_tail_frac: 0.15
+  device: cuda
+  seed: 1
+  balance_yaw: false
+  balance_bins_deg: [0.5, 1.0, 2.0, 4.0, 8.0]
+  augment:
+    enabled: true
+    temporal_swap_p: 0.35
+    horizontal_flip_p: 0.35
+    zero_motion_p: 0.25
+    brightness: 0.10
+    contrast: 0.15
+    noise_std: 0.012
+    blur_p: 0.15
+
+convert:
+  chip: cv181x
+  calibration_split: train
+  calib_frames: 100
+
+board:
+  host: root@10.43.61.1
+  remote_dir: /root/yaw_eval_robust
+  eval_max_pairs: 800
+
+paths:
+  workdir: work_robust
+
+compare:
+  orb_nfeatures: 1000
+  orb_yaw_sign: -1
+  intrinsics: [517.3, 516.5, 318.6, 255.3]
+  min_matches: 12

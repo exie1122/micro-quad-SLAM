@@ -1,0 +1,65 @@
+# ============================================================================
+# Yaw-correction pipeline config.
+#
+# *** DRY RUN ***  Public data (TUM RGB-D). Gyro is SIMULATED from GT angular
+# rate. This validates the PLUMBING end to end; it is NOT a scientific result.
+# Swap `dataset.adapter: real_rig` (after implementing RealRigDataset) to run on
+# real hardware data with NO other changes.
+# ============================================================================
+
+run_label: "DRY RUN - TUM RGB-D public data, SIMULATED gyro. Plumbing validation, not scientific results."
+
+dataset:
+  adapter: tum                                  # tum | real_rig
+  cache_dir: /home/ethan/.cache/yaw_pipeline/tum
+  img_size: 128
+  resize_mode: stretch                           # stretch reproduces the original dry run
+  frame_stride: 4                               # pair frames i, i+stride (~15 Hz pairs)
+  gyro_bias_deg_s: 0.8                           # simulated gyro constant bias
+  gyro_noise_deg_s: 0.15                         # simulated gyro per-sample noise
+  sequences:
+    train:
+      - rgbd_dataset_freiburg1_desk
+      - rgbd_dataset_freiburg1_rpy
+    test:                                        # WHOLE held-out sequence(s)
+      - rgbd_dataset_freiburg1_360
+
+train:
+  epochs: 40
+  batch_size: 64
+  lr: 0.001
+  weight_decay: 0.0001
+  val_tail_frac: 0.15                            # contiguous tail of each train seq -> val
+  device: cuda                                   # falls back to cpu automatically
+  seed: 0
+  balance_yaw: false
+  balance_bins_deg: [0.5, 1.0, 2.0, 4.0, 8.0]
+  augment:
+    enabled: false
+    temporal_swap_p: 0.0
+    horizontal_flip_p: 0.0
+    zero_motion_p: 0.0
+    brightness: 0.0
+    contrast: 0.0
+    noise_std: 0.0
+    blur_p: 0.0
+
+convert:
+  chip: cv181x
+  calibration_split: train                      # keep the final test recording untouched
+  calib_frames: 80                               # real training frames for INT8 calibration
+
+board:
+  host: root@10.43.61.1
+  remote_dir: /root/yaw_eval
+  eval_max_pairs: 800                            # cap NPU eval pairs (SSH loop cost)
+
+paths:
+  workdir: work                                  # all generated artifacts (gitignored)
+
+compare:
+  orb_nfeatures: 1000
+  orb_yaw_sign: -1                              # fixed camera-coordinate convention
+  # TUM freiburg1 pinhole intrinsics (native 640x480): fx, fy, cx, cy
+  intrinsics: [517.3, 516.5, 318.6, 255.3]
+  min_matches: 12                                # below this, ORB step = 0 (counted)

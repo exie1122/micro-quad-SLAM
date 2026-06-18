@@ -1,0 +1,27 @@
+{
+  "camera": "GC4653 via SG2002 CSI/VPSS",
+  "model": "original 128x128 stretch INT8 YawNet",
+  "test_condition": "nominally stationary unattended board; no external ground truth",
+  "raw_30_pairs": {
+    "mean_step_deg": 3.3659,
+    "step_std_deg": 0.6531,
+    "accumulated_yaw_deg": 100.9768,
+    "duration_s": 7.3424
+  },
+  "startup_offset_30_pairs": {
+    "calibration_pairs": 20,
+    "mean_step_deg": 0.0796,
+    "step_std_deg": 1.042,
+    "accumulated_yaw_deg": 2.388,
+    "duration_s": 7.34
+  },
+  "offset_plus_stationary_gate_50_pairs": {
+    "calibration_pairs": 20,
+    "stationary_pixel_mae_threshold": 4.0,
+    "stationary_gate_fraction": 0.88,
+    "mean_step_deg": -0.0678,
+    "step_std_deg": 0.364,
+    "accumulated_yaw_deg": -3.392
+  },
+  "conclusion": "The public-data model has a severe real-camera zero-motion domain bias. Startup offset and pixel-motion gating reduce stationary drift substantially, but moving-camera accuracy still requires a controlled hand-motion test with approximate angle endpoints."
+}
