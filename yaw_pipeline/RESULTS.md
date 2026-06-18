@@ -28,9 +28,10 @@ simulated everywhere.
 ## Pipeline stages (all ran on real data)
 `prep → train → convert(INT8) → deploy(NPU) → compare`
 
-- **Train:** best val MAE = **1.76°** (epoch 8). In-distribution fit is near-perfect
-  (corr 0.995 on a train seq); held-out generalization is partial (corr ≈ 0.41,
-  slope ≈ 0.59 on `fr1_360`) due to the desk/rpy → panning **domain gap**.
+- **Train:** best val MAE = **1.76°** (epoch 8). Current exported-model
+  evaluation gives train-recording correlations of 0.969/0.957, but held-out
+  generalization is weak (corr 0.183, slope 0.315 on `fr1_360`) due to the
+  desk/rpy → panning **domain gap**.
 - **Convert:** ONNX → INT8 `.cvimodel` (cv181x), calibrated on **80 real held-out
   frames** from `fr1_360`.
 - **Deploy:** **752 real INT8 inferences on the NPU**, **3.29 ms/inf (304 FPS)**.
@@ -78,3 +79,17 @@ python3 run_pipeline.py                 # prep -> train -> convert -> deploy -> 
 # or resume: python3 run_pipeline.py --start convert
 ```
 Artifacts (plots, metrics) are in `results/`. Heavy intermediates land in `work/` (gitignored).
+
+## Subsequent real-camera plumbing test
+
+The native `board/yaw_live.cpp` harness has now run against the GC4653 CSI camera.
+With the camera nominally stationary, the original model predicted +3.37° per
+pair and accumulated +101.0° over 30 pairs. This confirms a severe camera-domain
+bias. Startup visual-offset calibration and pixel-motion gating reduced a later
+50-pair stationary run to −3.39° total. This is a plumbing and zero-motion test.
+See `EXPERIMENTS.md`.
+
+The first handheld test then turned the camera approximately 90° and returned
+it to the start. YawNet detected the direction reversal, reached −50.36°, and
+finished at −26.56° instead of approximately 0°. This confirms that runtime is
+adequate but real-camera scale/generalization remains insufficient.

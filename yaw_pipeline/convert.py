@@ -14,18 +14,12 @@ import json
 import argparse
 import subprocess
 import numpy as np
-import cv2
-
 from config_util import load_config, ensure_workdir
+from preprocess import load_pair_float
 
 
-def _load_pair(p, size):
-    def g(path):
-        im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if im.shape != (size, size):
-            im = cv2.resize(im, (size, size), interpolation=cv2.INTER_AREA)
-        return im.astype(np.float32) / 255.0
-    return np.stack([g(p["img_a"]), g(p["img_b"])], 0)[None]   # [1,2,H,W]
+def _load_pair(p, size, resize_mode):
+    return load_pair_float(p, size, resize_mode)
 
 
 def run(cmd, cwd):
@@ -37,26 +31,26 @@ def run(cmd, cwd):
     return r
 
 
-def make_calib(manifest, workdir, n, size):
-    """Write n real held-out (test) frame-pair tensors as npz + a data_list."""
-    test_seq = manifest["splits"]["test"][0]
-    pairs = manifest["sequences"][test_seq]
+def make_calib(manifest, workdir, n, size, resize_mode, split):
+    """Write calibration tensors from a named split (train by default)."""
+    seq_names = manifest["splits"][split]
+    pairs = [p for seq in seq_names for p in manifest["sequences"][seq]]
     sel = np.linspace(0, len(pairs) - 1, n).astype(int)
     cdir = os.path.join(workdir, "calib")
     os.makedirs(cdir, exist_ok=True)
     lines = []
     for i, j in enumerate(sel):
-        x = _load_pair(pairs[j], size).astype(np.float32)
+        x = _load_pair(pairs[j], size, resize_mode).astype(np.float32)
         fp = os.path.join(cdir, f"calib_{i:03d}.npz")
         np.savez(fp, input=x)
         lines.append(fp)
     listf = os.path.join(workdir, "calib_list.txt")
     open(listf, "w").write("\n".join(lines) + "\n")
-    print(f"[convert] {n} REAL calibration tensors from held-out '{test_seq}'")
+    print(f"[convert] {n} real calibration tensors from {split} sequences: {seq_names}")
     return listf
 
 
-def fp32_predict(manifest, workdir, size):
+def fp32_predict(manifest, workdir, size, resize_mode):
     import onnxruntime as ort
     sess = ort.InferenceSession(os.path.join(workdir, "yaw_net.onnx"),
                                 providers=["CPUExecutionProvider"])
@@ -64,7 +58,7 @@ def fp32_predict(manifest, workdir, size):
         pairs = manifest["sequences"][seq]
         angles = []
         for p in pairs:
-            out = sess.run(None, {"input": _load_pair(p, size)})[0][0]
+            out = sess.run(None, {"input": _load_pair(p, size, resize_mode)})[0][0]
             out = out / (np.linalg.norm(out) + 1e-9)
             angles.append(float(np.arctan2(out[0], out[1])))
         np.savez(os.path.join(workdir, f"fp32_pred_{seq}.npz"), angle=np.array(angles))
@@ -79,14 +73,17 @@ def main():
     workdir = ensure_workdir(cfg)
     manifest = json.load(open(os.path.join(workdir, "manifest.json")))
     size = manifest["img_size"]
+    resize_mode = cfg["dataset"].get("resize_mode", "stretch")
     chip = cfg["convert"]["chip"]
+    calib_split = cfg["convert"].get("calibration_split", "train")
 
-    listf = make_calib(manifest, workdir, cfg["convert"]["calib_frames"], size)
+    listf = make_calib(manifest, workdir, cfg["convert"]["calib_frames"], size,
+                       resize_mode, calib_split)
 
     print("[convert] model_transform ...")
     run(["model_transform.py", "--model_name", "yaw_net",
          "--model_def", "yaw_net.onnx",
-         "--input_shapes", "[[1,2,128,128]]",
+         "--input_shapes", f"[[1,2,{size},{size}]]",
          "--mlir", "yaw_net.mlir"], cwd=workdir)
 
     print("[convert] run_calibration ...")
@@ -100,7 +97,7 @@ def main():
          "--quantize", "INT8", "--calibration_table", "yaw_net_cali_table",
          "--chip", chip, "--model", "yaw_net_int8.cvimodel"], cwd=workdir)
 
-    fp32_predict(manifest, workdir, size)
+    fp32_predict(manifest, workdir, size, resize_mode)
     print(f"[convert] DONE -> {os.path.join(workdir, 'yaw_net_int8.cvimodel')}")
 
 

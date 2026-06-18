@@ -18,27 +18,19 @@ geometry.py) and a per-pair gyro yaw-rate (rad/s) which may be REAL or SIMULATED
 """
 from __future__ import annotations
 import os
+import zlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, Union, List
 
 import numpy as np
-import cv2
-
 from geometry import quat_to_matrix, relative_yaw
+from preprocess import load_gray
 
 
 def _load_gray(src: Union[str, np.ndarray], size: int) -> np.ndarray:
     """Load `src` (path or HxW array) as a size×size uint8 grayscale image."""
-    if isinstance(src, np.ndarray):
-        img = src if src.ndim == 2 else cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
-    else:
-        img = cv2.imread(src, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(src)
-    if img.shape != (size, size):
-        img = cv2.resize(img, (size, size), interpolation=cv2.INTER_AREA)
-    return img
+    return load_gray(src, size, "stretch")
 
 
 @dataclass
@@ -147,7 +139,9 @@ class TumYawDataset(YawDataset):
                 tx, ty, tz, qx, qy, qz, qw = map(float, gt_rows[j])
                 R[i] = quat_to_matrix(qx, qy, qz, qw)
 
-        rng = np.random.default_rng(self.seed + abs(hash(name)) % 10000)
+        # Python's built-in hash is randomized between processes; CRC32 keeps
+        # simulated-noise runs reproducible across machines and invocations.
+        rng = np.random.default_rng(self.seed + zlib.crc32(name.encode("utf-8")) % 10000)
         s = self.frame_stride
         pairs = []
         for i in range(0, len(rgb_ts) - s):

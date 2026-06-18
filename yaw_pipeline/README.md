@@ -37,3 +37,22 @@ python3 run_pipeline.py --start convert  # resume from a stage
 ```
 Board access (USB/Ethernet gadget, no WiFi): `root@10.43.61.1`, key-based SSH.
 Outputs: `results/` (committed plots + metrics), `work/` (heavy intermediates, gitignored).
+
+## Live SG2002 camera test
+
+`board/yaw_live.cpp` is a native GC4653 CSI harness. It uses CVI VPSS capture and
+`cviruntime` directly, so it does not depend on V4L2 or Python on the board. It
+logs raw, corrected, and accumulated yaw plus pixel motion and NPU latency.
+
+The executable is currently deployed as `/root/yaw_live`. For the original model:
+
+```bash
+/root/yaw_live /root/yaw_eval/yaw_net_int8.cvimodel \
+  --size 128 --stride 4 --resize stretch --calibrate 20 \
+  --stationary-pixel 4.0 --pairs 100 --log /root/yaw_live.csv
+```
+
+Keep the camera still during the 20-pair startup calibration. See
+`board/README.md` for build details and `EXPERIMENTS.md` for accepted/rejected
+accuracy results. Dataset coverage and exported-model metrics can be regenerated
+with `analyze_dataset.py` and `evaluate_fp32.py`.

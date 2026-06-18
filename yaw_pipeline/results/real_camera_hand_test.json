@@ -1,0 +1,17 @@
+{
+  "camera": "GC4653 via SG2002 CSI/VPSS",
+  "model": "original 128x128 stretch INT8 YawNet",
+  "motion": "approximately 90 degree hand turn followed by return to start",
+  "pairs": 48,
+  "stationary_calibration_pairs": 20,
+  "stationary_pixel_mae_threshold": 4.0,
+  "stationary_gate_fraction": 0.1458,
+  "predicted_min_accumulated_yaw_deg": -50.358,
+  "predicted_final_accumulated_yaw_deg": -26.562,
+  "expected_final_accumulated_yaw_deg_approx": 0.0,
+  "mean_step_deg": -0.553,
+  "step_std_deg": 2.793,
+  "npu_ms_mean": 4.165,
+  "npu_ms_p95": 8.088,
+  "interpretation": "The model detected the direction reversal but substantially underestimated motion and retained about 26.6 degrees of round-trip drift. Runtime is adequate; real-camera accuracy is not deployment-ready."
+}

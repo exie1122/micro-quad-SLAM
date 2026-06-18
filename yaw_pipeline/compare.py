@@ -104,19 +104,16 @@ def main():
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     orb_yaw = np.zeros(n)
     orb_fail = 0
-    last = 0.0
     for i, p in enumerate(pairs):
         y = orb_relative_yaw(p["img_a"], p["img_b"], orb, bf, K, cc["min_matches"])
         if y is None:
-            orb_yaw[i] = last; orb_fail += 1      # hold last estimate on failure
+            orb_yaw[i] = 0.0
+            orb_fail += 1
         else:
-            orb_yaw[i] = y; last = y
-    # ORB sign convention: align handedness to GT (coordinate convention only, not magnitude)
-    if np.corrcoef(orb_yaw, gt)[0, 1] < 0:
-        orb_yaw = -orb_yaw
-        orb_sign_flipped = True
-    else:
-        orb_sign_flipped = False
+            orb_yaw[i] = y
+    # Coordinate handedness is configured once; never infer it from test GT.
+    orb_sign = float(cc.get("orb_yaw_sign", 1.0))
+    orb_yaw *= orb_sign
 
     # accumulate
     acc_gt = accumulate(gt)
@@ -166,7 +163,7 @@ def main():
         "test_sequence": test_seq,
         "n_pairs": int(n),
         "orb_failed_pairs": int(orb_fail),
-        "orb_sign_flipped": orb_sign_flipped,
+        "orb_yaw_sign": orb_sign,
         "gt_total_yaw_deg": float(np.degrees(acc_gt[-1])),
         "methods": res,
         "int8_vs_fp32": int8_fp32,

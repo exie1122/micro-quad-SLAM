@@ -15,9 +15,8 @@ import argparse
 import subprocess
 import tarfile
 import numpy as np
-import cv2
-
 from config_util import load_config, ensure_workdir
+from preprocess import load_gray
 
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=12"]
@@ -31,8 +30,8 @@ ins = sorted(glob.glob(os.path.join(d, "inputs", "*.npz")))
 tmp = os.path.join(d, "in.npz")
 out_vals = []
 for f in ins:
-    u8 = np.load(f)["u8"]                       # [2,128,128] uint8
-    x = (u8.astype(np.float32) / 255.0)[None]   # [1,2,128,128]
+    u8 = np.load(f)["u8"]                       # [2,H,W] uint8
+    x = (u8.astype(np.float32) / 255.0)[None]   # [1,2,H,W]
     np.savez(tmp, input=x)
     of = os.path.join(d, "out.npz")
     subprocess.run(["model_runner", "--model", os.path.join(d, "yaw_net_int8.cvimodel"),
@@ -52,13 +51,9 @@ print("BOARD_EVAL_DONE", len(out_vals))
 '''
 
 
-def _load_pair_u8(p, size):
-    def g(path):
-        im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if im.shape != (size, size):
-            im = cv2.resize(im, (size, size), interpolation=cv2.INTER_AREA)
-        return im
-    return np.stack([g(p["img_a"]), g(p["img_b"])], 0).astype(np.uint8)  # [2,H,W]
+def _load_pair_u8(p, size, resize_mode):
+    return np.stack([load_gray(p["img_a"], size, resize_mode),
+                     load_gray(p["img_b"], size, resize_mode)], 0).astype(np.uint8)
 
 
 def sh(cmd):
@@ -77,6 +72,7 @@ def main():
     workdir = ensure_workdir(cfg)
     manifest = json.load(open(os.path.join(workdir, "manifest.json")))
     size = manifest["img_size"]
+    resize_mode = cfg["dataset"].get("resize_mode", "stretch")
     host = cfg["board"]["host"]
     rdir = cfg["board"]["remote_dir"]
     cap = cfg["board"]["eval_max_pairs"]
@@ -90,7 +86,8 @@ def main():
     for f in os.listdir(indir):
         os.remove(os.path.join(indir, f))
     for i, p in enumerate(pairs):
-        np.savez_compressed(os.path.join(indir, f"in_{i:04d}.npz"), u8=_load_pair_u8(p, size))
+        np.savez_compressed(os.path.join(indir, f"in_{i:04d}.npz"),
+                            u8=_load_pair_u8(p, size, resize_mode))
 
     # bundle inputs + model + board script (gzip for the slow USB link)
     tarpath = os.path.join(workdir, "eval_bundle.tar")
