@@ -8,6 +8,11 @@ The system combines optical flow velocity estimation, time-of-flight (ToF) depth
 
 The goal is to explore whether a highly constrained nano-quadcopter platform can support GPS-denied navigation and mapping for applications such as search-and-rescue, structural inspection, and confined-space exploration.
 
+The full project — methodology, results, and analysis — is summarized in the science fair poster below:
+
+![Science fair poster summarizing the project](scienceFair_Poster.png)
+*Figure: Science fair poster presenting the system design, methodology, and key findings.*
+
 ![Drone (older version)](drone%20photo.png)
 *Figure: Earlier prototype of the nano-quadcopter platform; hardware has since been updated.*
 
