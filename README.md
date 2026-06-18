@@ -13,8 +13,8 @@ The full project — methodology, results, and analysis — is summarized in the
 ![Science fair poster summarizing the project](scienceFair_Poster.png)
 *Figure: Science fair poster presenting the system design, methodology, and key findings.*
 
-![Drone (older version)](drone%20photo.png)
-*Figure: Earlier prototype of the nano-quadcopter platform; hardware has since been updated.*
+![Drone (older version)](polished_drone_img.png)
+*Figure: Earlier prototype of the nano-quadcopter platform
 
 ---
 
