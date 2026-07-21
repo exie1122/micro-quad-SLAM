@@ -7,13 +7,14 @@
 | Core mission, safety, planning | `c/autonomy/` | native and RISC-V build target |
 | Default launch | `scripts/run_autonomy.sh` | fake backend, exploration disabled |
 | Replay | `scripts/replay_autonomy.sh` | strict SCLOG3; no serial/commands |
-| Live MAVLink | `vehicle_backend.c` | fail-closed; integration blocked |
-| Live map/ToF | `mapping_adapter.c` | replay implemented; live blocked |
+| Live MAVLink | `mavlink_backend.c` behind `vehicle_backend.c` | nonblocking UART/UDP, bounded queues, ACK + observed state |
+| Live map/ToF | `live_tof_adapter.c` → `mapping_adapter.c` | explicit `legacy-a5-v0`, checksum/order/staleness validation |
+| Target startup | `deploy/`, `config/autonomy-live.conf` | systemd monitor-only; never passes `--start-mission` |
 | Legacy hover/frontier | `c/*.c` | retained reference, not default |
 
-There was no service, init script, or deployed executable in the repository to
-update. Any target-side service that exists outside source control must be audited
-before props-off use.
+No prior service existed. The new service is not enabled by installation and fails
+until serial permission/configuration is explicitly validated. Target-side units
+outside source control still require a props-off audit.
 
 ## Old behavior and failure mechanism
 
@@ -57,14 +58,20 @@ ACK/observation → arm request and ACK/observation → conservative takeoff ACK
 measured rise → target altitude → stable hover dwell → scan → plan → bounded stream
 → hover/replan → land → touchdown observation → disarm observation → close`.
 
-The fake backend implements this contract without external I/O. Replay suppresses
-all actuating calls. MAVLink/SITL intentionally return unavailable.
+The fake backend implements this contract without external I/O and replay suppresses
+all actuating calls. Live MAVLink uses one outstanding `COMMAND_LONG` transaction,
+an internal correlation ID, exact command/source/target matching, bounded retries,
+and independently observed state. ArduPilot's wire command has no request transaction
+ID, so serialization is the correlation mechanism; duplicate, late, and wrong ACKs
+are counted and ignored.
 
 ## Test evidence
 
 Final command results are recorded at the end of `AUTONOMY_UPGRADE_LOG.md`. The
-strict host suite passes 107 C checks plus Python integration, ASan/UBSan, cppcheck,
-all 3,726 committed replay records, and static RISC-V cross-compilation. Unit coverage includes grid conversion/bounds/staleness,
+strict host suite passes 110 core C checks and 161 live-interface C checks plus
+Python integration, ASan/UBSan, cppcheck, all 3,726 committed replay records, and
+static RISC-V cross-compilation. Real-backend ArduCopter SITL passes both a normal
+mission and an injected stale-ToF HOLD/LAND mission. Unit coverage includes grid conversion/bounds/staleness,
 unknown blocking, inflation, frontier clustering/rejection, scoring components,
 bounded planning, narrow-gap rejection, safety escalation, smoothing, transition
 ordering, timeout/interrupt landing, strict replay versions, deterministic replay,
@@ -72,15 +79,11 @@ live refusal, and production-launch ownership.
 
 ## Remaining integration blockers
 
-1. Implement the real nonblocking MAVLink backend using the existing generated
-   headers, with command-ID-correlated ACKs and independently observed mode/arm,
-   altitude, landed, and disarmed states.
-2. Connect the real `/dev/ttyS1` ToF/map producer to `MappingAdapter`, including
-   pose-time alignment and an explicit feed version; reject fake/synthetic sources.
-3. Add target-side service/deployment files and prove that no external startup unit
-   still launches an old binary.
-4. Run ArduPilot SITL through the same backend and inject stale map/pose/link faults.
-5. Conduct props-off UART, sensor age, mode/ACK, takeoff-command suppression, land,
+1. Audit the actual LicheeRV filesystem for older external systemd/init/cron units.
+2. Confirm the deployed ESP32 firmware is exactly the unversioned A5 format; live
+   launch requires the operator-assigned compatibility ID `legacy-a5-v0` because
+   the wire frame itself has no version byte.
+3. Conduct props-off UART, sensor age, mode/ACK, takeoff-command suppression, land,
    and touchdown/disarm tests on the actual LicheeRV/H743 wiring.
 
-Until all five are evidenced, the stack is for host replay/dry-run only.
+The software is suitable for the props-off integration sequence, not propeller-on flight.

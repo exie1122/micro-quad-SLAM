@@ -3,12 +3,15 @@
 
 #include "autonomy_types.h"
 #include "recorded_log.h"
+#include "tof_protocol.h"
 
 typedef struct {OccupancyGrid grid;uint32_t rejected_records;} MappingAdapter;
 
 bool mapping_adapter_init(MappingAdapter *adapter,CellState *storage,uint16_t width,uint16_t height,
                           float resolution_m,float center_x_m,float center_y_m,bool synthetic);
 bool mapping_adapter_apply_sclog3(MappingAdapter *adapter,const Sclog3Record *record);
+bool mapping_adapter_apply_live_tof(MappingAdapter *adapter,const TofFrame *frame,
+                                    const VehiclePose *pose,uint64_t maximum_pose_age_ms);
 bool mapping_adapter_live_available(void);
 
 #endif

@@ -1,0 +1,9 @@
+/var/log/micro-quad-autonomy/*/*.log /var/log/micro-quad-autonomy/*/*.csv {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -16,12 +16,20 @@ Synthetic maps are permitted only for fake mode. Exploration requires the explic
 
 ## SITL
 
-`--backend sitl` currently fails closed with `BACKEND_UNAVAILABLE`. This is
-intentional: no ArduPilot SITL connector existed in the repository, and pointing
-the fake backend at a network endpoint would not test the real MAVLink path.
+SITL uses the real MAVLink backend and the real C mission/planning/safety stack.
+Build ArduCopter separately, then run:
 
-Before enabling SITL, implement it through `vehicle_backend.h` using the same
-message/ACK/observation logic intended for UART. Then automate and record:
+```bash
+python3 scripts/run_sitl_integration.py --ardupilot-root /path/to/ardupilot --fault none
+python3 scripts/run_sitl_integration.py --ardupilot-root /path/to/ardupilot --fault stale-tof
+```
+
+The harness creates a PTY that emits the exact checksummed `legacy-a5-v0` sensor
+wire format; the production parser and mapper consume it. It does not inject a fake
+occupancy grid. ArduPilot's built-in optical-flow backend reports quality 51, so the
+harness explicitly supplies `--minimum-flow-quality 50`; live deployment retains 60.
+
+The normal test records:
 
 - expected heartbeat/system/component identity;
 - GUIDED transition ACK and observation;
@@ -29,9 +37,12 @@ message/ACK/observation logic intended for UART. Then automate and record:
 - takeoff ACK, altitude rise/target, stable hover dwell;
 - exploration start only with fresh real map adapter data;
 - stable-rate bounded command streaming;
-- injected stale pose, map, ToF, flow, range, and heartbeat;
-- planner/no-progress recovery and repeat-failure landing;
 - LAND, touchdown observation, then disarm.
 
-Passing SITL is not a physical-hardware pass and must not remove the live opt-in or
-synthetic-map prohibition.
+The fault test stops the validated ToF byte stream after EXPLORE and requires
+`HOVER_SCAN/EXPLORE → HOLD → LAND → DISARM`. PTY unit tests cover delayed/missing/
+wrong/duplicate/late ACK, target mismatch, malformed frames, pre-arm health, FC
+restart, link loss, and airborne disarm refusal. Core mission/safety tests cover
+stale pose/map/flow/range/heartbeat, low battery, planner failure, and no progress.
+Those faults were not misreported as real-backend SITL cases. Passing SITL is not
+a physical-hardware pass.

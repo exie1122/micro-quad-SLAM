@@ -2,8 +2,8 @@
 
 ## DO NOT PROCEED TO REAL FLIGHT IF:
 
-- `mapping_adapter_live_available()` is false (it currently is).
-- MAVLink/SITL returns `BACKEND_UNAVAILABLE` (it currently does).
+- the deployment validator fails or the exact serial devices/permissions differ.
+- the ESP32 protocol cannot be confirmed as the exact `legacy-a5-v0` A5 frame.
 - Any test in `make test`, `make sanitize`, or `make riscv` fails.
 - A target startup service still references `clean_uav_fc_tof_nav`, `frontier`,
   `uav_local_nav`, or another unguarded executable.
@@ -34,13 +34,17 @@
 10. Review the run manifest and decision log for every gate, clamp, transition,
     ACK, observed state, and failure response.
 
-## Deployment command shape (future only)
+## Deployment commands
 
 ```text
-autonomy_controller --backend mavlink --allow-live-serial --serial /dev/ttyS2 \
-  --map-source live
+/opt/micro-quad-autonomy/bin/autonomy_controller --backend mavlink \
+  --allow-live-serial --serial /dev/ttyS2 --baud 57600 \
+  --expected-system 1 --expected-component 1 \
+  --tof-serial /dev/ttyS1 --tof-baud 115200 \
+  --tof-protocol legacy-a5-v0 --map-source live
 ```
 
-This must still start exploration-disabled. A separate explicit `--explore` may be
-used only after the whole checklist and safety review. Today the command refuses
-before device access; that is the correct behavior.
+This exact command is monitor-only because it omits `--start-mission`; startup can
+never arm. Only an attended props-off procedure may add `--start-mission`, and only
+after that may `--explore` be considered. The installed systemd service never adds
+`--start-mission` under any configuration.

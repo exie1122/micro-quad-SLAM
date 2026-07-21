@@ -28,9 +28,20 @@ no sleep-based wait is permitted. An ACK alone is never proof of mode, arm, take
 landing, or disarm success. Repeated send failures are an irrecoverable backend
 failure. SIGINT/SIGTERM enters the same land/touchdown/disarm sequence when armed.
 
-## Current implementation boundary
+## Implemented correlation boundary
 
-The fake backend proves the interface and mission sequencing. Replay never calls
-actuating functions. The MAVLink and SITL backend returns unavailable before opening
-any device because the ACK/state machinery above is not implemented in the new
-stack. Legacy direct-UART code remains evidence only.
+`mavlink_backend.c` implements this sequence with nonblocking `O_NONBLOCK` I/O,
+a 16-frame transmit ring, one outstanding command, a 1.2 s deadline, and two retries.
+`COMMAND_LONG` has no caller transaction number, so the backend assigns an internal
+correlation ID and serializes commands; an ACK must match command, FC source IDs,
+companion target extensions (when populated), and the active time window. ACK alone
+never sets mode, armed, altitude, or landed state. An accepted arm ACK and an accepted
+disarm ACK are distinguished by stored parameter 1. Reconnect/FC restart latches an
+operator-reset requirement and never re-arms.
+
+Explicit message intervals request heartbeat, attitude, local-NED pose, range,
+battery/status, landed state, and optical flow. Invalid floating-point telemetry is
+discarded. When ArduPilot advertises `MAV_SYS_STATUS_PREARM_CHECK`, preflight waits
+for that bit to be healthy in a fresh `SYS_STATUS`; an arm rejection still aborts.
+Only `SET_POSITION_TARGET_LOCAL_NED` and standard mode/arm/takeoff/land
+commands are emitted; there is no motor or force-disarm command.

@@ -162,7 +162,10 @@ make test
 make riscv
 ```
 
-MAVLink and SITL modes currently fail closed because the hardened nonblocking
-ACK/state backend and production mapping adapter are not integrated. Passing live
-opt-in flags does not bypass that blocker. Do not use the legacy binaries for a
-flight. See `docs/live_hardware_checklist.md` and `AUTONOMY_INTEGRATION_REPORT.md`.
+The nonblocking MAVLink and production `legacy-a5-v0` ToF/map adapters are integrated,
+but fake remains the default and automatic startup is monitor-only. See
+`docs/target_deployment.md` for installation and `docs/dry_run_and_sitl.md` for the
+real-backend SITL harness. Live operation requires explicit vehicle and ToF devices,
+expected IDs, protocol selection, and `--allow-live-serial`; arming additionally
+requires `--start-mission`. Do not use a legacy binary or proceed beyond the
+props-off sequence in `docs/live_hardware_checklist.md`.

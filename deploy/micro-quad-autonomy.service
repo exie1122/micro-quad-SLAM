@@ -1,0 +1,29 @@
+[Unit]
+Description=Micro-quad hardened autonomy monitor (never auto-arms)
+After=dev-ttyS1.device dev-ttyS2.device
+Wants=dev-ttyS1.device dev-ttyS2.device
+
+[Service]
+Type=simple
+User=uav-autonomy
+Group=uav-autonomy
+SupplementaryGroups=dialout
+Environment=AUTONOMY_CONFIG=/etc/micro-quad-autonomy/autonomy.conf
+ExecStartPre=/opt/micro-quad-autonomy/bin/validate_deployment.sh /etc/micro-quad-autonomy/autonomy.conf
+# run_live_service.sh never passes --start-mission. Restart therefore cannot arm.
+ExecStart=/opt/micro-quad-autonomy/bin/run_live_service.sh /etc/micro-quad-autonomy/autonomy.conf
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/micro-quad-autonomy
+DevicePolicy=closed
+DeviceAllow=/dev/ttyS1 rw
+DeviceAllow=/dev/ttyS2 rw
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
