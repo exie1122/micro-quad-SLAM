@@ -1,3 +1,6 @@
+/* LEGACY REAL-FLIGHT CODE — retained for history and comparison.
+ * Not the default supported autonomy controller.
+ */
 //old code. do not use. change to either clean_uav_tof_nav.c or exploration.c (currently in the works)
 
 

@@ -1,3 +1,6 @@
+/* LEGACY REAL-FLIGHT CODE — retained for history and comparison.
+ * Not the default supported autonomy controller. Use c/autonomy instead.
+ */
 // uav_fc_local_nav.c  (stability-first “ETH-ish” single-drone behavior)
 //
 // STABILITY/DEMO REVISION:

@@ -1,3 +1,6 @@
+/* LEGACY REAL-FLIGHT CODE — retained for history and comparison.
+ * Manual/logging reference only; not the default supported autonomy controller.
+ */
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 

@@ -1,0 +1,5 @@
+#include "frontier_history.h"
+#include <math.h>
+static int find(const FrontierHistory*h,GridPoint g,float r){if(!h||!isfinite(g.x_m)||!isfinite(g.y_m)||!isfinite(r)||r<=0)return-1;for(uint16_t i=0;i<FRONTIER_HISTORY_CAPACITY;++i)if(h->entries[i].valid&&hypotf(h->entries[i].goal.x_m-g.x_m,h->entries[i].goal.y_m-g.y_m)<=r)return(int)i;return-1;}
+float frontier_history_penalty(const FrontierHistory*h,GridPoint g,uint64_t now,float radius){int i=find(h,g,radius);if(i<0)return 0.0f;const FrontierHistoryEntry*e=&h->entries[i];float age_s=now>=e->last_attempt_ms?(float)(now-e->last_attempt_ms)*.001f:0.0f;float recency=age_s<60.0f?1.0f-age_s/60.0f:0.0f;return .5f*e->attempts+2.0f*e->failures+recency;}
+void frontier_history_record(FrontierHistory*h,GridPoint g,uint64_t now,bool failed,float radius){if(!h)return;int i=find(h,g,radius);if(i<0){i=h->next++%FRONTIER_HISTORY_CAPACITY;h->entries[i]=(FrontierHistoryEntry){.goal=g,.valid=true};}FrontierHistoryEntry*e=&h->entries[i];if(e->attempts<UINT16_MAX)e->attempts++;if(failed&&e->failures<UINT16_MAX)e->failures++;e->last_attempt_ms=now;}

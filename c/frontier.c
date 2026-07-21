@@ -1,3 +1,7 @@
+/* LEGACY REAL-FLIGHT CODE — retained for history and comparison.
+ * Not the default supported autonomy controller. Direct launch requires
+ * --allow-legacy-unsafe-frontier.
+ */
 // uav_fc_local_nav.c  (stability-first “ETH-ish” single-drone behavior)
 //
 // STABILITY/DEMO REVISION:
@@ -5081,6 +5085,16 @@ int main(int argc, char** argv) {
 
   signal(SIGINT,  sig_handler);
   signal(SIGTERM, sig_handler);
+
+  bool legacy_gate = false;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "--allow-legacy-unsafe-frontier") == 0) legacy_gate = true;
+  }
+  if (!legacy_gate) {
+    fprintf(stderr, "REFUSED: legacy frontier controller is unsupported. Use the hardened launcher.\n");
+    fprintf(stderr, "Historical execution requires --allow-legacy-unsafe-frontier.\n");
+    return 2;
+  }
 
   log_init();
 

@@ -136,10 +136,11 @@ Key observations:
 
 Key files:
 
-- `c/clean_uav_fc_tof_nav.c` — autonomous flight and navigation code
-- `c/manual_uav_fc_tof_nav.c` — manual flight controller version with logging
-- `c/uav_local_nav.c` — local navigation logic
-- `c/frontier.c` — frontier exploration / navigation work
+- `c/autonomy/` — authoritative, bounded C autonomy core and guarded runner
+- `c/clean_uav_fc_tof_nav.c` — legacy real-flight hover code (reference only)
+- `c/manual_uav_fc_tof_nav.c` — legacy manual/logging code
+- `c/uav_local_nav.c` — legacy local-navigation code
+- `c/frontier.c` — legacy real-flight frontier code; explicit unsafe gate required
 - `python/plot_scan.py` — 2D mapping / scan visualization script
 - `python/plot_scan_3d.py` — 3D point-cloud viewer and room-alignment tool
 - `arduino/tof_esp32.ino` — ESP32 sensor hub firmware
@@ -148,12 +149,20 @@ Key files:
 
 ---
 
-## Build
+## Safe build and execution
 
-### Compile Command
+The supported launcher defaults to a fake backend with exploration disabled. It
+does not open UARTs:
 
 ```bash
-riscv64-linux-gnu-gcc -Os -std=gnu11 -w -static \
-  -ffunction-sections -fdata-sections -Wl,--gc-sections \
-  -I"$HOME/c_library_v2" \
-  c/clean_uav_fc_tof_nav.c -o uav_fc_tof_nav_riscv_static -lm
+make test
+./scripts/run_autonomy.sh
+./scripts/run_autonomy.sh --explore              # synthetic dry-run only
+./scripts/replay_autonomy.sh log/3_frontierTest_scanlog.bin
+make riscv
+```
+
+MAVLink and SITL modes currently fail closed because the hardened nonblocking
+ACK/state backend and production mapping adapter are not integrated. Passing live
+opt-in flags does not bypass that blocker. Do not use the legacy binaries for a
+flight. See `docs/live_hardware_checklist.md` and `AUTONOMY_INTEGRATION_REPORT.md`.

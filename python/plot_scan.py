@@ -134,21 +134,34 @@ SCAN_FMT = '<IQIIfffffffffffffffffffIIIHHHHHHBBBBBBBBH512s'
 def parse_log(filename):
     print(f"Reading {filename}...")
     records = []
-    
+
     with open(filename, 'rb') as f:
-        # Check for header
         header = f.read(7)
-        if header == b'SCLOG3\n':
-            print("Found SCLOG3 header.")
-        else:
-            print("No header/unknown format, attempting to read from start.")
-            f.seek(0)
-            
-        while True:
-            chunk = f.read(RECORD_SIZE)
-            if len(chunk) < RECORD_SIZE:
+        if header != b'SCLOG3\n':
+            version = header.decode('ascii', errors='replace').strip()
+            raise ValueError(
+                f"Unsupported scanlog header {version!r}; this parser accepts SCLOG3 only. "
+                "Refusing to reinterpret SCLOG1/SCLOG2 bytes as SCLOG3."
+            )
+        print("Found SCLOG3 header.")
+        payload = f.read()
+
+        offset = 0
+        while offset < len(payload):
+            remaining = len(payload) - offset
+            if remaining < RECORD_SIZE:
+                print(f"WARNING: truncated SCLOG3 tail: {remaining} byte(s) ignored.")
                 break
-                
+            if payload[offset:offset + 4] != b'SCN3':
+                next_record = payload.find(b'SCN3', offset + 1)
+                if next_record < 0:
+                    print(f"WARNING: no record magic after byte {offset + 7}; replay stopped.")
+                    break
+                print(f"WARNING: skipped {next_record - offset} corrupt/non-record byte(s) "
+                      f"before byte {next_record + 7}.")
+                offset = next_record
+                continue
+            chunk = payload[offset:offset + RECORD_SIZE]
             data = struct.unpack(SCAN_FMT, chunk)
             
             # Extract basic pose
@@ -179,6 +192,7 @@ def parse_log(filename):
                 'grid_bytes': data[41]
             }
             records.append(rec)
+            offset += RECORD_SIZE
             
     print(f"Loaded {len(records)} records.")
     return records

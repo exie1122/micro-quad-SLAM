@@ -16,6 +16,8 @@ result/
 calib_images/
 
 # Local build / generated artifacts
+build/
+runs/
 *.o
 *.out
 *.elf
