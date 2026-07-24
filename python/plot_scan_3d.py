@@ -42,7 +42,7 @@ import numpy as np
 from plot_scan import (
     parse_log,
     build_filter_profile,
-    compute_stable_hover_t_ms,
+    configure_startup_filter,
     frame_pose_is_usable,
     extract_frame_measurements,
     build_projection_tables,
@@ -140,7 +140,7 @@ def prepare_scan_dataset(
         use_startup_filter=use_startup_filter,
     )
     if use_startup_filter:
-        profile['stable_hover_t_ms'] = compute_stable_hover_t_ms(records)
+        configure_startup_filter(profile, records)
     else:
         profile['stable_hover_t_ms'] = 0
 

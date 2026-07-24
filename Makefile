@@ -29,6 +29,7 @@ test: $(TEST_BIN) $(LIVE_TEST_BIN) $(AUTONOMY_BIN)
 	$(TEST_BIN)
 	$(LIVE_TEST_BIN)
 	python3 tests/test_integration.py
+	MPLBACKEND=Agg python3 tests/test_plot_scan.py
 
 sanitize: CFLAGS := -std=gnu11 -O1 -g -Wall -Wextra -Wpedantic -Werror -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize: clean test
