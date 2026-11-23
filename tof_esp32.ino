@@ -1,3 +1,12 @@
+// Post-mortem fixes (see ../analysis/REPORT.md):
+//  - Zones whose target_status is not a valid range (5, or 9 = valid with large pulse) are sent
+//    as 0xFFFF. Previously every zone's distance_mm was sent even when the sensor flagged it
+//    invalid, and the companion mapped those as obstacles.
+//  - A frame is sent only when at least one sensor produced new data, without the fixed
+//    delay(80) and the per-loop status printout (which re-bound every I2C bus a second time).
+//    Measured frame rate before: ~5 Hz (196 ms) against a 10 Hz ranging setting.
+//  - ESP-NOW commands go through a small queue so two frames arriving 8 ms apart are both
+//    forwarded (the single g_cmd slot could overwrite one).
 #include <Wire.h>
 #include <SparkFun_VL53L5CX_Library.h>
 #include <HardwareSerial.h>
@@ -51,9 +60,15 @@ struct __attribute__((packed)) ArmMsg {
 
 static constexpr uint8_t ESPNOW_CHANNEL = 1;
 
-static volatile bool     g_haveCmd = false;
-static volatile uint8_t  g_cmd     = 0;
-static volatile uint32_t g_seq     = 0;
+// Small single-producer (ESP-NOW callback) / single-consumer (loop) queue.
+#define CMD_Q_LEN 8
+static volatile uint8_t  g_qCmd[CMD_Q_LEN];
+static volatile uint32_t g_qSeq[CMD_Q_LEN];
+static volatile uint8_t  g_qHead = 0;   // written by callback
+static volatile uint8_t  g_qTail = 0;   // written by loop
+static portMUX_TYPE      g_qMux = portMUX_INITIALIZER_UNLOCKED;
+
+static bool g_newData[4] = {false, false, false, false};
 
 SparkFun_VL53L5CX tof[NUM_SENSORS];
 VL53L5CX_ResultsData dataArr[NUM_SENSORS];
@@ -87,9 +102,20 @@ void bindBus(int i) {
   delayMicroseconds(200);
 }
 
+// VL53L5CX target_status: 5 = valid, 9 = valid (large pulse). Everything else (no target,
+// sigma/phase failures, wrap-around, ...) is unreliable and reported as 0xFFFF.
+static inline bool zoneValid(const VL53L5CX_ResultsData &m, int zone) {
+  if (m.nb_target_detected[zone] == 0) return false;
+  uint8_t st = m.target_status[zone * VL53L5CX_NB_TARGET_PER_ZONE];
+  return st == 5 || st == 9;
+}
+
 uint16_t getCell(const VL53L5CX_ResultsData &m, int row, int col) {
-  int x = 7 - col;
-  return m.distance_mm[x + row * 8];
+  int x = 7 - col;                 // ST returns zones mirrored; flip so col 0 = left (from behind)
+  int zone = x + row * 8;
+  if (!zoneValid(m, zone)) return 0xFFFF;
+  int16_t d = m.distance_mm[zone * VL53L5CX_NB_TARGET_PER_ZONE];
+  return (d <= 0) ? 0xFFFF : (uint16_t)d;
 }
 
 static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -101,9 +127,14 @@ static void onEspNowRecv(const esp_now_recv_info_t *info, const uint8_t *data, i
   if (m.magic != 0xC3) return;
   if (m.cmd != CMD_ARM && m.cmd != CMD_DISARM) return;
 
-  g_cmd = m.cmd;
-  g_seq = m.seq;
-  g_haveCmd = true;
+  portENTER_CRITICAL(&g_qMux);       // ESP-NOW callbacks run in the WiFi task, not an ISR
+  uint8_t next = (uint8_t)((g_qHead + 1) % CMD_Q_LEN);
+  if (next != g_qTail) {           // drop if full (8 pending commands is already abnormal)
+    g_qCmd[g_qHead] = m.cmd;
+    g_qSeq[g_qHead] = m.seq;
+    g_qHead = next;
+  }
+  portEXIT_CRITICAL(&g_qMux);
 }
 
 static void espnowInit() {
@@ -168,11 +199,19 @@ void setup() {
 }
 
 void loop() {
-  if (g_haveCmd) {
-    Serial.println("Recieved Arm Command!");
-    uint8_t  cmd = g_cmd;
-    uint32_t seq = g_seq;
-    g_haveCmd = false;
+  // Forward every queued ESP-NOW command (ARM/DISARM are sent twice by the M5Stack and the
+  // companion requires two matching frames).
+  for (;;) {
+    uint8_t cmd = 0; uint32_t seq = 0; bool have = false;
+    portENTER_CRITICAL(&g_qMux);
+    if (g_qTail != g_qHead) {
+      cmd = g_qCmd[g_qTail]; seq = g_qSeq[g_qTail];
+      g_qTail = (uint8_t)((g_qTail + 1) % CMD_Q_LEN);
+      have = true;
+    }
+    portEXIT_CRITICAL(&g_qMux);
+    if (!have) break;
+    Serial.println("Received command");
     forwardCmdToLuckfox(cmd, seq);
   }
 
@@ -181,51 +220,44 @@ void loop() {
     bindBus(i);
     if (tof[i].isDataReady()) {
       tof[i].getRangingData(&dataArr[i]);
+      g_newData[i] = true;
     }
   }
 
-  Serial.println("---- SENSOR STATUS ----");
-
+  // Send a frame once every initialised sensor has new data (or after 150 ms so one slow or
+  // failed sensor can't stall the others). Sensors without data since the last frame are sent
+  // as 0xFFFF so the companion never maps an old frame at a new pose.
+  // If no sensor has new data, send nothing: the companion's scan_fresh() then goes stale and
+  // its failsafes act, instead of being fed an all-invalid "fresh" frame.
+  static uint32_t lastSendMs = 0;
+  bool allNew = true, someNew = false;
   for (int i = 0; i < NUM_SENSORS; i++) {
-    Serial.printf("Sensor %d: ", i);
-
-    if (!ok[i]) {
-      Serial.println("NOT INITIALIZED");
-      continue;
-    }
-
-    bindBus(i);
-
-    if (tof[i].isDataReady()) {
-      Serial.println("DATA READY");
-    } else {
-      Serial.println("NO DATA");
-    }
+    if (!ok[i]) continue;
+    if (g_newData[i]) someNew = true; else allNew = false;
   }
-
-  Serial.println("-----------------------");
+  uint32_t nowMs = millis();
+  bool send = someNew && (allNew || (nowMs - lastSendMs) >= 150);
+  if (!send) { delay(2); return; }
+  lastSendMs = nowMs;
 
   memset(txbuf, 0, sizeof(txbuf));
   txbuf[0] = SCAN_HEADER;
-
-  uint32_t tms = millis();
-  wr_u32_le(&txbuf[1], tms);
+  wr_u32_le(&txbuf[1], nowMs);
 
   int off = 5;
   for (int d = 0; d < 4; d++) {
     int s = dirToSensor[d];
+    bool fresh = ok[s] && g_newData[s];
     for (int r = 0; r < 8; r++) {
       for (int c = 0; c < 8; c++) {
-        uint16_t v = ok[s] ? getCell(dataArr[s], r, c) : 0xFFFF;
+        uint16_t v = fresh ? getCell(dataArr[s], r, c) : 0xFFFF;
         wr_u16_le(&txbuf[off], v);
         off += 2;
       }
     }
   }
+  for (int i = 0; i < NUM_SENSORS; i++) g_newData[i] = false;
 
   txbuf[SCAN_BYTES - 1] = checksum8(txbuf, SCAN_BYTES - 1);
-
   SBC.write(txbuf, SCAN_BYTES);
-
-  delay(80);
 }

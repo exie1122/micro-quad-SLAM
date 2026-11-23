@@ -15,6 +15,23 @@
 // Companion code can *request* poshold/althold, but if your FC estimator/OF/rangefinder is bad,
 // the FC will drift anyway. This script makes the companion-side behavior as strict as possible
 // (continuous setpoint streaming + gating), and failsafes to LAND if pose/alt is unhealthy.
+//
+// POST-MORTEM FIX REVISION (see analysis/REPORT.md):
+// - Fixed-rate control loop (CONTROL_PERIOD_MS). Previously control_tick() ran on every poll()
+//   wakeup and saturated the 57600-baud FC link; ~97% of frames arrived fragmented.
+// - Exactly ONE setpoint per tick (queue_setpoint + flush at end of tick), never written as a
+//   fragment: writes are all-or-nothing and setpoints are dropped (not truncated) if the TX queue
+//   is backed up. Commands (mode/arm/disarm) are written whole.
+// - Only SET_POSITION_TARGET_LOCAL_NED type_masks that ArduCopter 4.x accepts are used
+//   (pure position, pure velocity, or full position+velocity). ArduPilot treats a field group
+//   as ignored if ANY of its bits is set; the old "ignore x,y but use z" style masks were
+//   rejected and caused mode_guided.init(true) -> position controller reset.
+// - Airwall now moves the hold anchor / move target away from the wall instead of sending a
+//   (rejected) velocity command.
+// - ToF: middle rows only (no floor), invalid zones dropped, true 45 deg FOV, filter updates
+//   once per new frame, parser resyncs after a bad checksum, ARM needs 2 confirmed frames.
+// - Frontier: log-odds occupancy grid, 45 deg yaw sweep to cover the gaps between sensors,
+//   targets >= FRONTIER_MIN_TARGET_DIST_M away, noise-tolerant progress check.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,12 +50,25 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 
 #include "common/mavlink.h"
 
 // ----------------------------- UART config -----------------------------
 #define FC_UART  "/dev/ttyS2"
+// Must match SERIALn_BAUD on the FC. 57600 is far too slow for this message load;
+// set SERIAL5_BAUD=921 on the FC and run with --fc-baud 921600.
 #define FC_BAUD  57600
+static int fc_baud = FC_BAUD;
+
+// ----------------------------- Loop / link budget ----------------------
+// control_tick() runs at a fixed rate; every tick sends at most one setpoint.
+#define CONTROL_PERIOD_MS      40     // 25 Hz (ArduPilot GUIDED needs > ~3 Hz; 10-30 Hz is typical)
+// If more than this many bytes are still waiting in the kernel TX queue, a setpoint is dropped
+// (whole) rather than queued behind stale data. ~256 B is ~45 ms at 57600, ~3 ms at 921600.
+#define FC_TXQ_SOFT_LIMIT_B    256
+#define FC_WRITE_TIMEOUT_MS    50     // commands: max wait for room before the first byte
+#define FC_WRITE_HARD_TIMEOUT_MS 200  // absolute cap, even mid-frame (never freeze the loop)
 
 #define TOF_UART "/dev/ttyS1"
 #define TOF_BAUD 115200
@@ -104,6 +134,9 @@ static int     tof_rxpos = 0;
 #define HUMAN_LAG_MS        500
 #define HUMAN_STALE_MS      1200
 
+#define CTRL_ARM_CONFIRM_MS    500
+#define CTRL_ARM_MIN_STREAK    2     // M5Stack sends ARM twice; a single frame can be line noise
+
 static uint8_t ctrl_rxbuf[CTRL_BYTES];
 static int     ctrl_rxpos = 0;
 
@@ -130,6 +163,13 @@ enum Dir { D_FRONT=0, D_RIGHT=1, D_BACK=2, D_LEFT=3 };
 // ----------------------------- ToF processing --------------------------
 #define TOF_COLS 8
 #define TOF_ROWS 8
+// VL53L5CX: 45 deg vertical FOV, rows centred at about +/-2.8, 8.4, 14.1, 19.7 deg.
+// The outer rows see the floor (e.g. 1.5 m at 0.45 m altitude), so only the middle rows are
+// used for ranging. Rows 2..5 span +/-11 deg, keeping the floor > 2.5 m away at 0.5 m altitude.
+// The band is symmetric, so it works whichever way up each sensor is mounted.
+#define TOF_ROW_FIRST 2
+#define TOF_ROW_LAST  5
+static volatile bool tof_filter_pending = false;   // set per new frame, consumed by tof_filter_tick
 
 static float tof_beams_m[4][TOF_COLS];             // [dir][col] distance (m)
 static float tof_min_m[4]  = { NAN,NAN,NAN,NAN };  // min across beams (per dir)
@@ -180,16 +220,26 @@ enum {
   FRONTIER_GRID_H = 1024,
   FRONTIER_GRID_CELLS = FRONTIER_GRID_W * FRONTIER_GRID_H
 };
-static const float    FRONTIER_SENSOR_FOV_DEG          = 70.0f;
+static const float    FRONTIER_SENSOR_FOV_DEG          = 45.0f;  // VL53L5CX horizontal FOV (was 70: bent walls outward)
 static const float    FRONTIER_RAY_STEP_M              = 0.075f;
 static const float    FRONTIER_OCC_END_MARGIN_M        = 0.05f;
 static const float    FRONTIER_OCCUPIED_MAX_RANGE_M    = 3.50f;
-static const float    FRONTIER_TARGET_CLEARANCE_M      = 0.14f;  // must be < GRID_CELL_M (0.15) so adjacent-to-wall cells pass; airwall handles proximity
-static const float    FRONTIER_PATH_CLEARANCE_M        = 0.14f;  // same: in a 0.55m corridor with 0.15m cells, adjacent cells have clearance=0.15m
-static const float    FRONTIER_STEP_MAX_M              = 0.25f;
+static const float    FRONTIER_MAP_MAX_TILT_DEG        = 12.0f;  // skip map updates while tilted (rays hit floor/ceiling)
+// Log-odds occupancy (int8 per cell). A single spurious return no longer creates a permanent
+// obstacle, and a single grazing free ray no longer erases a wall.
+#define FRONTIER_LO_UNKNOWN   ((int8_t)-128)
+static const int      FRONTIER_LO_FREE_STEP            = -1;
+static const int      FRONTIER_LO_OCC_STEP             = 2;
+static const int      FRONTIER_LO_MIN                  = -6;
+static const int      FRONTIER_LO_MAX                  = 10;
+static const int      FRONTIER_LO_OCC_THRESH           = 4;      // >= 2 net hits to count as occupied
+static const float    FRONTIER_TARGET_CLEARANCE_M      = 0.25f;  // target cell must not hug a wall
+static const float    FRONTIER_PATH_CLEARANCE_M        = 0.14f;  // path may pass a cell adjacent to a wall
+static const float    FRONTIER_MIN_TARGET_DIST_M       = 0.60f;  // ignore frontier cells closer than this (inside pose noise)
+static const float    FRONTIER_STEP_MAX_M              = 0.80f;  // was 0.25 (< lock-break drift of 0.30)
 static const float    FRONTIER_TARGET_DIST_CAP_M       = 1.20f;
 static const float    FRONTIER_ARRIVAL_TOL_M           = 0.20f;
-static const float    FRONTIER_MAX_DRIFT_M             = 0.80f;
+static const float    FRONTIER_MAX_DRIFT_M             = 0.50f;
 static const float    FRONTIER_EMERGENCY_OBS_M         = 0.12f;  // was 0.22: in corridors the side walls are always nearby; airwall repulsion handles proximity
 static const float    FRONTIER_MOVE_REJECT_OBS_M       = 0.30f;
 static const float    FRONTIER_MAX_SELECT_SPEED_MPS    = 0.20f;
@@ -199,14 +249,26 @@ static const uint32_t FRONTIER_MAX_MOVES               = 12;
 static const uint32_t FRONTIER_MAX_MOVE_FAILURES       = 3;
 static const float    FRONTIER_FWD_HALF_CONE_DEG       = 120.0f; // reject targets outside this half-angle from nose
 static const float    FRONTIER_HEADING_PENALTY         = 0.40f;  // score penalty at cone edge (scaled by angle fraction)
-static const uint32_t FRONTIER_MIN_CLUSTER_CELLS       = 2;
+static const uint32_t FRONTIER_MIN_CLUSTER_CELLS       = 3;      // 1-2 cell clusters are almost always noise holes
 static const uint64_t FRONTIER_SCAN_FRESH_MS           = 800;
 static const uint64_t FRONTIER_SCAN_HOVER_MS           = 1200;
 static const uint64_t FRONTIER_SETTLE_MS               = 1500;
 static const uint64_t FRONTIER_MOVE_TIMEOUT_MS         = 7000;
 static const uint64_t FRONTIER_MOVE_DIAG_MS            = 500;
-static const uint64_t FRONTIER_PROGRESS_CHECK_MS       = 2000;   // check error progress interval
-static const float    FRONTIER_PROGRESS_MIN_GAIN_M     = 0.02f;  // min error reduction per check interval
+// Progress gate: abort a move if the best error has not improved by MIN_GAIN within STALL_MS,
+// or if the error grows DIVERGE_M beyond the best seen. (Old gate: 2 cm per 2 s, i.e. inside
+// position noise, aborted 5 of 6 moves in 3_hallWay.)
+static const uint64_t FRONTIER_PROGRESS_STALL_MS       = 3000;
+static const float    FRONTIER_PROGRESS_MIN_GAIN_M     = 0.05f;
+static const float    FRONTIER_PROGRESS_DIVERGE_M      = 0.20f;
+// Yaw sweep during HOVER_SCAN: 4 sensors x 45 deg leave four 45 deg blind wedges on the
+// diagonals. Rotating 45 deg (in steps below YAW_DRIFT_ACCEPT_DEG) fills them. Without it the
+// only "frontiers" in a small room were the drone's own blind spots.
+static const float    FRONTIER_SCAN_YAW_SPAN_DEG       = 45.0f;
+static const float    FRONTIER_SCAN_YAW_STEP_DEG       = 12.0f;  // + up to 5 deg settle error stays < 20 deg guardian
+static const float    FRONTIER_SCAN_YAW_SETTLE_DEG     = 5.0f;
+static const uint64_t FRONTIER_SCAN_YAW_DWELL_MS       = 400;
+static const uint64_t FRONTIER_SCAN_YAW_TIMEOUT_MS     = 8000;
 static const uint64_t FRONTIER_MAX_TIME_MS             = 60000;
 static const uint64_t FRONTIER_SENSOR_ABORT_MS         = 2500;
 
@@ -219,8 +281,9 @@ static const float    AIRWALL_MAX_VEL_MPS  = 0.30f;  // peak push-back speed
 static const uint64_t AIRWALL_LOG_MS       = 1000;   // log throttle interval
 
 // Yaw drift guardian: if the actual heading drifts more than this from the
-// commanded target (e.g. due to magnetometer interference near walls),
-// accept the new heading rather than letting ArduPilot fight to rotate back.
+// commanded target, drop XY lock and re-acquire. NOTE: the flight logs show the compass was
+// unhealthy and never fused (XKF4.SM = 0), so yaw is gyro-only; excursions are physical
+// (torque/impact), not magnetometer interference.
 static const float YAW_DRIFT_ACCEPT_DEG = 20.0f;
 // If the yaw drift guardian fires this many times within the window, the
 // heading is spinning uncontrollably — land instead of chasing it.
@@ -659,8 +722,16 @@ static uint64_t hover_ready_fail_log_ms = 0;
 static char     hover_ready_fail_last_reason[160] = {0};
 
 // ----------------------------- Frontier exploration --------------------
-static int8_t   frontier_grid[FRONTIER_GRID_H][FRONTIER_GRID_W];
+static int8_t   frontier_grid[FRONTIER_GRID_H][FRONTIER_GRID_W];   // log-odds, FRONTIER_LO_UNKNOWN = never observed
 static bool     frontier_grid_initialized = false;
+static bool     frontier_bb_valid = false;                           // bounding box of observed cells
+static int      frontier_bb_x0 = 0, frontier_bb_x1 = 0, frontier_bb_y0 = 0, frontier_bb_y1 = 0;
+// Yaw-sweep sub-state of ST_HOVER_SCAN
+static int      frontier_scan_yaw_phase = 0;    // 0 = dwell at start heading, 1 = rotating, 2 = dwell at end
+static int      frontier_scan_yaw_dir = 1;      // alternates +1/-1 each scan cycle
+static float    frontier_scan_yaw_goal_deg = 0.0f;
+static uint64_t frontier_scan_yaw_phase_ms = 0;
+static uint64_t frontier_scan_yaw_start_ms = 0;
 static float    frontier_grid_origin_x_m = NAN;
 static float    frontier_grid_origin_y_m = NAN;
 static uint64_t frontier_last_map_scan_ms = 0;
@@ -883,7 +954,9 @@ static bool phase_uses_z_only(HoverPhase phase) {
 }
 
 static float hover_target_alt_m_for_phase(HoverPhase phase) {
-  float target_m = (phase == HPH_FULL_HOVER) ? HOVER_TARGET_M : TAKEOFF_TARGET_M;
+  // One altitude for every airborne hover phase. Previously prelock used TAKEOFF_TARGET_M and
+  // locked hover used HOVER_TARGET_M, so every lock gain/loss stepped the Z target by 5 cm.
+  float target_m = (phase == HPH_TAKEOFF_Z_ONLY) ? TAKEOFF_TARGET_M : HOVER_TARGET_M;
   float max_up = CEIL_M - CEIL_MARGIN_M;
   if (max_up < 0.10f) max_up = 0.10f;
   if (target_m > max_up) target_m = max_up;
@@ -982,13 +1055,20 @@ static int open_uart(const char* dev, int baud) {
   tio.c_cflag |= (CLOCAL | CREAD);
   tio.c_cflag &= ~CRTSCTS;
 
-  speed_t sp = B57600;
+  speed_t sp;
   switch (baud) {
+    case 921600: sp = B921600; break;
+    case 460800: sp = B460800; break;
+    case 230400: sp = B230400; break;
     case 115200: sp = B115200; break;
     case 57600:  sp = B57600; break;
     case 38400:  sp = B38400; break;
     case 19200:  sp = B19200; break;
-    default: sp = B57600; break;
+    default:
+      // Previously fell back to 57600 silently, which hides a config mismatch.
+      log_msg("open_uart(%s): unsupported baud %d\n", dev, baud);
+      close(fd);
+      return -1;
   }
   cfsetispeed(&tio, sp);
   cfsetospeed(&tio, sp);
@@ -1003,14 +1083,77 @@ static int open_uart(const char* dev, int baud) {
 }
 
 // ----------------------------- MAVLink send ----------------------------
+// The FC fd is O_NONBLOCK (needed for reads). The old mav_send() ignored write()'s return
+// value, so once the kernel TX buffer filled every frame went out as a fragment and failed CRC
+// on the FC (FC log: SERIAL5 Rx 5760 B/s, 1-4 valid packets/s). These helpers never emit a
+// partial frame: either the whole frame is written or nothing is.
+static uint32_t fc_tx_dropped_setpoints = 0;
+static uint32_t fc_tx_failed_writes = 0;
+
+static int fc_txq_bytes(void) {
+  int q = 0;
+  if (fc_fd >= 0 && ioctl(fc_fd, TIOCOUTQ, &q) == 0) return q;
+  return -1;  // unknown
+}
+
+static bool fc_write_all(const uint8_t* buf, size_t n, int timeout_ms) {
+  if (fc_fd < 0) return false;
+  size_t off = 0;
+  uint64_t t0 = now_ms();
+  while (off < n) {
+    ssize_t w = write(fc_fd, buf + off, n - off);
+    if (w > 0) { off += (size_t)w; continue; }
+    if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      fc_tx_failed_writes++;
+      return false;  // nothing sensible to do; if off > 0 the FC parser will resync on next STX
+    }
+    // No room. Before the first byte we may give up cleanly; once a frame has started it
+    // should be finished or the FC sees a corrupt frame -- but never block the control loop
+    // indefinitely (a stalled UART must not freeze failsafes). A UART at >=57600 baud drains a
+    // whole frame in < 12 ms, so the hard cap only trips if the port is genuinely stuck.
+    uint64_t waited = now_ms() - t0;
+    if ((off == 0 && waited > (uint64_t)timeout_ms) || waited > FC_WRITE_HARD_TIMEOUT_MS) {
+      fc_tx_failed_writes++;
+      return false;
+    }
+    struct pollfd p = { .fd = fc_fd, .events = POLLOUT, .revents = 0 };
+    poll(&p, 1, 5);
+  }
+  return true;
+}
+
+// Commands / requests / heartbeat: always sent whole (may block briefly).
 static void mav_send(const mavlink_message_t* msg) {
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
   uint16_t n = mavlink_msg_to_send_buffer(buf, msg);
-  if (fc_fd >= 0) {
-      int ret = write(fc_fd, buf, n);
-      (void)ret;
-  }
+  (void)fc_write_all(buf, n, FC_WRITE_TIMEOUT_MS);
 }
+
+// Setpoints: at most one per control tick (last writer wins, matching ArduPilot semantics),
+// flushed at the end of control_tick(). Dropped whole if the TX queue is backed up, so the FC
+// never receives a stale backlog.
+static mavlink_message_t sp_pending;
+static bool              sp_have_pending = false;
+
+static void queue_setpoint(const mavlink_message_t* msg) {
+  sp_pending = *msg;
+  sp_have_pending = true;
+}
+
+static void flush_setpoint(void) {
+  if (!sp_have_pending) return;
+  sp_have_pending = false;
+  uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+  uint16_t n = mavlink_msg_to_send_buffer(buf, &sp_pending);
+  int q = fc_txq_bytes();
+  if (q >= 0 && (q + (int)n) > FC_TXQ_SOFT_LIMIT_B) {
+    fc_tx_dropped_setpoints++;
+    return;
+  }
+  (void)fc_write_all(buf, n, 0);
+}
+
+static void discard_pending_setpoint(void) { sp_have_pending = false; }
 
 static void send_command_long_tgt(uint8_t tgt_sys, uint8_t tgt_comp, uint16_t cmd,
                                   float p1,float p2,float p3,float p4,float p5,float p6,float p7) {
@@ -1096,7 +1239,7 @@ static bool set_mode_custom(uint32_t custom_mode, const char* name) {
   if ((uint32_t)hb_custom_mode == custom_mode) return false;
 
   uint64_t t = now_ms();
-  if (t - last_mode_cmd_ms < 800) return false;
+  if (t - last_mode_cmd_ms < 300) return false;
   last_mode_cmd_ms = t;
 
   if (name) {
@@ -1119,8 +1262,8 @@ static void set_mode_guided(void) {
   (void)set_mode_custom(4, "GUIDED");
 }
 
-static void set_mode_land(void) {
-  (void)set_mode_custom(9, "LAND");
+static bool set_mode_land(void) {
+  return set_mode_custom(9, "LAND");
 }
 
 static void set_mode_stabilize(void) {
@@ -1144,7 +1287,7 @@ static void disarm_fc_force(void) {
   static uint64_t last_disarm_log_ms = 0;
 
   uint64_t t = now_ms();
-  if (t - last_disarm_cmd_ms < 800) return;
+  if (t - last_disarm_cmd_ms < 250) return;
   last_disarm_cmd_ms = t;
 
   if (t - last_disarm_log_ms > 2000) {
@@ -1160,26 +1303,76 @@ static void guided_takeoff(float alt_m) {
   send_command_long(MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0, alt_m);
 }
 
-// Velocity command with selectable MAV_FRAME
+// ---------------------------------------------------------------------------------------------
+// SET_POSITION_TARGET_LOCAL_NED type_mask shapes that ArduCopter 4.x accepts.
+// ArduCopter (GCS_Mavlink.cpp, handle_message_set_position_target_local_ned) treats a group
+// (position / velocity / accel) as IGNORED IF ANY BIT OF THE GROUP IS SET, and then only accepts:
+// position only, velocity only, accel only, or position+velocity(+accel). Anything else, e.g.
+// "ignore x,y but use z", falls through to mode_guided.init(true), which re-initialises the
+// position controller at the CURRENT position, velocity and lean angle. That is what made the
+// old prelock/"Z-only"/takeoff-brake/airwall/ceiling-locked commands hold drift instead of
+// correcting it. Only use these four masks.
+#define PT_IGN_POS      ((1u<<0)|(1u<<1)|(1u<<2))
+#define PT_IGN_VEL      ((1u<<3)|(1u<<4)|(1u<<5))
+#define PT_IGN_ACC      ((1u<<6)|(1u<<7)|(1u<<8))
+#define PT_IGN_YAW      (1u<<10)
+#define PT_IGN_YAWRATE  (1u<<11)
+#define PT_MASK_POS_YAW        ((uint16_t)(PT_IGN_VEL | PT_IGN_ACC | PT_IGN_YAWRATE))
+#define PT_MASK_VEL_YAW        ((uint16_t)(PT_IGN_POS | PT_IGN_ACC | PT_IGN_YAWRATE))
+#define PT_MASK_VEL_YAWRATE    ((uint16_t)(PT_IGN_POS | PT_IGN_ACC | PT_IGN_YAW))
+#define PT_MASK_POSVEL_YAW     ((uint16_t)(PT_IGN_ACC | PT_IGN_YAWRATE))
+
+static void queue_local_ned(uint16_t mask,
+                            float x, float y, float z,
+                            float vx, float vy, float vz,
+                            float yaw_rad_cmd, float yaw_rate_rad_s) {
+  mavlink_message_t m;
+  mavlink_msg_set_position_target_local_ned_pack(
+      g_sysid, g_compid, &m,
+      (uint32_t)now_ms(),
+      fc_sysid, fc_compid,
+      MAV_FRAME_LOCAL_NED,
+      mask,
+      x, y, z,
+      vx, vy, vz,
+      0, 0, 0,
+      yaw_rad_cmd, yaw_rate_rad_s);
+  queue_setpoint(&m);
+}
+
+// Companion-side altitude P loop. Only used when a pure-velocity setpoint is unavoidable
+// (no fresh LOCAL_POSITION_NED to fill x/y). Returns vz in NED (+ = down).
+static const float ALT_HOLD_KP      = 1.0f;   // 1/s
+static const float ALT_HOLD_VZ_MAX  = 0.30f;  // m/s
+static float alt_hold_vz_down(float z_target_down) {
+  float z_now_down = NAN;
+  if (lpos_fresh(now_ms()) && isfinite(lpos_alt_m)) z_now_down = -lpos_alt_m;   // same frame as setpoint z
+  else if (isfinite(alt_est_m)) z_now_down = -alt_est_m;
+  if (!isfinite(z_now_down)) return 0.0f;
+  float vz = ALT_HOLD_KP * (z_target_down - z_now_down);
+  if (vz >  ALT_HOLD_VZ_MAX) vz =  ALT_HOLD_VZ_MAX;
+  if (vz < -ALT_HOLD_VZ_MAX) vz = -ALT_HOLD_VZ_MAX;
+  return vz;
+}
+
+static bool lpos_xy_fresh_now(void) {
+  return lpos_fresh(now_ms()) && isfinite(lpos_x_m) && isfinite(lpos_y_m) && isfinite(lpos_alt_m);
+}
+
+// Velocity command with selectable MAV_FRAME (pure velocity + yaw rate: valid shape)
 static void send_vel_frame(float vx, float vy, float vz, float yaw_rate_deg_s, uint8_t frame) {
   if (!have_fc) return;
 
-  // Log command (throttled)
   static uint64_t last_log = 0;
   uint64_t t = now_ms();
   if (t - last_log > 2000) {
     last_log = t;
     char buf[64];
-    snprintf(buf, sizeof(buf), "CMD_VEL frame=%u vx=%.2f vy=%.2f vz=%.2f yr=%.1f", 
+    snprintf(buf, sizeof(buf), "CMD_VEL frame=%u vx=%.2f vy=%.2f vz=%.2f yr=%.1f",
        frame, vx, vy, vz, yaw_rate_deg_s);
     if(log_fp) { fprintf(log_fp, "# %s\n", buf); }
     if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
   }
-
-  uint16_t mask =
-      (1<<0)|(1<<1)|(1<<2) |      // ignore position
-      (1<<6)|(1<<7)|(1<<8) |      // ignore accel
-      (1<<10);                    // ignore yaw (use yaw_rate)
 
   mavlink_message_t m;
   mavlink_msg_set_position_target_local_ned_pack(
@@ -1187,17 +1380,18 @@ static void send_vel_frame(float vx, float vy, float vz, float yaw_rate_deg_s, u
       (uint32_t)now_ms(),
       fc_sysid, fc_compid,
       frame,
-      mask,
+      PT_MASK_VEL_YAWRATE,
       0,0,0,
       vx,vy,vz,
       0,0,0,
       0, deg2rad(yaw_rate_deg_s)
   );
-  mav_send(&m);
+  queue_setpoint(&m);
 }
 
-// Ceiling hold: XY position hold (if locked) + Z velocity + yaw hold.
-// Used during ceiling descent so the drone doesn't drift in XY.
+// Ceiling hold: descend at vz_down while holding XY (and yaw).
+// Locked: position+velocity with x,y = lock anchor, z = current z, vz = descent feed-forward.
+// Not locked / wall close: pure velocity (airwall push-back in XY, descent in Z).
 static void send_ceiling_hold(float vz_down) {
   if (!have_fc) return;
 
@@ -1214,52 +1408,28 @@ static void send_ceiling_hold(float vz_down) {
     if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
   }
 
-  uint16_t mask;
-  float px = 0.0f, py = 0.0f;
-  float vx = 0.0f, vy = 0.0f;
-
-  // Never let ceiling override cancel wall repulsion. If any wall is close,
-  // run velocity mode with airwall XY push-back while still commanding descent.
   float aw_vx = 0.0f, aw_vy = 0.0f;
   bool airwall_active = airwall_repulsion(t, &aw_vx, &aw_vy);
 
-  if (!airwall_active && hover_xy_locked) {
-    // Hold locked XY position, command Z velocity, hold yaw
-    px = hover_lock_x_m;
-    py = hover_lock_y_m;
-    mask = (1<<2)              // ignore z position (use vz instead)
-         | (1<<3)|(1<<4)      // ignore vx,vy (position controller handles XY)
-         | (1<<6)|(1<<7)|(1<<8) // ignore accel
-         | (1<<11);           // ignore yaw_rate
+  if (!airwall_active && hover_xy_locked &&
+      isfinite(hover_lock_x_m) && isfinite(hover_lock_y_m) && lpos_xy_fresh_now()) {
+    queue_local_ned(PT_MASK_POSVEL_YAW,
+                    hover_lock_x_m, hover_lock_y_m, -lpos_alt_m,
+                    0.0f, 0.0f, vz_down,
+                    deg2rad(yaw), 0.0f);
   } else {
-    // Velocity mode: either no XY lock (zero XY) or active airwall push-back.
-    if (airwall_active) {
-      vx = aw_vx;
-      vy = aw_vy;
-    }
-    mask = (1<<0)|(1<<1)|(1<<2) // ignore position
-         | (1<<6)|(1<<7)|(1<<8) // ignore accel
-         | (1<<11);             // ignore yaw_rate
+    queue_local_ned(PT_MASK_VEL_YAW,
+                    0.0f, 0.0f, 0.0f,
+                    airwall_active ? aw_vx : 0.0f, airwall_active ? aw_vy : 0.0f, vz_down,
+                    deg2rad(yaw), 0.0f);
   }
-
-  mavlink_message_t m;
-  mavlink_msg_set_position_target_local_ned_pack(
-      g_sysid, g_compid, &m,
-      (uint32_t)now_ms(),
-      fc_sysid, fc_compid,
-      MAV_FRAME_LOCAL_NED,
-      mask,
-      px, py, 0.0f,
-      vx, vy, vz_down,
-      0,0,0,
-      deg2rad(yaw), 0
-  );
-  mav_send(&m);
 }
 
-// Pre-lock hover: brake lateral motion with XY velocity control while keeping
-// altitude and yaw under position control. This avoids chasing a distant
-// preliminary XY anchor and re-triggering high-velocity lock failures.
+// Pre-lock hover / takeoff brake: drive XY velocity to (vx, vy) without chasing a stale anchor,
+// while holding the target altitude and yaw.
+// Position+velocity with x,y = latest measured position (so there is no position error to
+// chase), z = target altitude (ArduPilot's own Z position loop), vx,vy = desired velocity.
+// Falls back to pure velocity + companion altitude P loop if LOCAL_POSITION_NED is stale.
 static void send_prelock_hold(float vx, float vy) {
   if (!have_fc) return;
 
@@ -1276,32 +1446,23 @@ static void send_prelock_hold(float vx, float vy) {
     if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
   }
 
-  uint16_t mask =
-      (1<<0)|(1<<1)          // ignore x,y position (use vx,vy)
-    | (1<<5)                 // ignore vz (use z position)
-    | (1<<6)|(1<<7)|(1<<8)   // ignore accel
-    | (1<<11);               // ignore yaw_rate
-
-  mavlink_message_t m;
-  mavlink_msg_set_position_target_local_ned_pack(
-      g_sysid, g_compid, &m,
-      (uint32_t)now_ms(),
-      fc_sysid, fc_compid,
-      MAV_FRAME_LOCAL_NED,
-      mask,
-      0.0f, 0.0f, z_down,
-      vx, vy, 0.0f,
-      0,0,0,
-      deg2rad(yaw), 0
-  );
-  mav_send(&m);
+  if (lpos_xy_fresh_now()) {
+    queue_local_ned(PT_MASK_POSVEL_YAW,
+                    lpos_x_m, lpos_y_m, z_down,
+                    vx, vy, 0.0f,
+                    deg2rad(yaw), 0.0f);
+  } else {
+    queue_local_ned(PT_MASK_VEL_YAW,
+                    0.0f, 0.0f, 0.0f,
+                    vx, vy, alt_hold_vz_down(z_down),
+                    deg2rad(yaw), 0.0f);
+  }
 }
 
-// Position+Yaw hold command in LOCAL_NED
+// Position+Yaw hold command in LOCAL_NED (pure position: valid shape)
 static void send_pos_yaw_ned(float x, float y, float z_down, float yaw_deg) {
   if (!have_fc) return;
 
-  // Log command (throttled)
   static uint64_t last_log = 0;
   uint64_t t = now_ms();
   if (t - last_log > 2000) {
@@ -1312,27 +1473,11 @@ static void send_pos_yaw_ned(float x, float y, float z_down, float yaw_deg) {
     if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
   }
 
-  uint16_t mask =
-      (1<<3)|(1<<4)|(1<<5) |     // ignore vx,vy,vz
-      (1<<6)|(1<<7)|(1<<8) |     // ignore ax,ay,az
-      (1<<11);                   // ignore yaw_rate
-
-  mavlink_message_t m;
-  mavlink_msg_set_position_target_local_ned_pack(
-      g_sysid, g_compid, &m,
-      (uint32_t)now_ms(),
-      fc_sysid, fc_compid,
-      MAV_FRAME_LOCAL_NED,
-      mask,
-      x, y, z_down,
-      0,0,0,
-      0,0,0,
-      deg2rad(yaw_deg), 0
-  );
-  mav_send(&m);
+  queue_local_ned(PT_MASK_POS_YAW, x, y, z_down, 0, 0, 0, deg2rad(yaw_deg), 0.0f);
 }
 
-// Z-only + Yaw hold command in LOCAL_NED (ignore X/Y positions)
+// "Z + yaw only" hold. A Z-only position target does not exist in ArduCopter (it was rejected
+// and reset the controller), so this is zero XY velocity + companion altitude P loop.
 static void send_z_yaw_ned(float z_down, float yaw_deg) {
   if (!have_fc) return;
 
@@ -1346,28 +1491,13 @@ static void send_z_yaw_ned(float z_down, float yaw_deg) {
     if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
   }
 
-  uint16_t mask =
-      (1<<0)|(1<<1) |            // ignore x,y position
-      (1<<3)|(1<<4)|(1<<5) |     // ignore vx,vy,vz
-      (1<<6)|(1<<7)|(1<<8) |     // ignore ax,ay,az
-      (1<<11);                   // ignore yaw_rate
-
-  mavlink_message_t m;
-  mavlink_msg_set_position_target_local_ned_pack(
-      g_sysid, g_compid, &m,
-      (uint32_t)now_ms(),
-      fc_sysid, fc_compid,
-      MAV_FRAME_LOCAL_NED,
-      mask,
-      0.0f, 0.0f, z_down,
-      0,0,0,
-      0,0,0,
-      deg2rad(yaw_deg), 0
-  );
-  mav_send(&m);
+  queue_local_ned(PT_MASK_VEL_YAW, 0, 0, 0, 0.0f, 0.0f, alt_hold_vz_down(z_down), deg2rad(yaw_deg), 0.0f);
 }
 
-// Conservative attitude+thrust setpoint (GUIDED) using ENCODE.
+// SET_ATTITUDE_TARGET in GUIDED. NOTE: with GUID_OPTIONS bit 3 (SetAttitudeTarget_ThrustAsThrust)
+// clear -- the FC default and this vehicle's setting -- ArduCopter reads "thrust" as a CLIMB-RATE
+// request: 0.5 = hold altitude, 1.0 = max climb (PILOT_SPEED_UP), 0.0 = max descent.
+// It is NOT a throttle. Callers below pass a climb-rate fraction in that convention.
 static void send_attitude_target_thrust(float thrust, float yaw_deg) {
   if (!have_fc) return;
 
@@ -1376,13 +1506,13 @@ static void send_attitude_target_thrust(float thrust, float yaw_deg) {
   if (t - last_log > 500) { // Log this one more frequently (ramp)
     last_log = t;
     char buf[64];
-    snprintf(buf, sizeof(buf), "CMD_ATT thr=%.2f yaw=%.1f", thrust, yaw_deg);
+    snprintf(buf, sizeof(buf), "CMD_ATT climb_frac=%.2f yaw=%.1f", thrust, yaw_deg);
     if(log_fp) { fprintf(log_fp, "# %s\n", buf); }
     if(txt_log_fp) { fprintf(txt_log_fp, "[%.3f] %s\n", t*0.001f, buf); }
   }
 
   if (thrust < 0.0f) thrust = 0.0f;
-  if (thrust > 0.80f) thrust = 0.80f;
+  if (thrust > 0.80f) thrust = 0.80f;   // <= 60% of max climb rate
 
   mavlink_set_attitude_target_t at;
   memset(&at, 0, sizeof(at));
@@ -1413,7 +1543,7 @@ static void send_attitude_target_thrust(float thrust, float yaw_deg) {
 
   mavlink_message_t m;
   mavlink_msg_set_attitude_target_encode(g_sysid, g_compid, &m, &at);
-  mav_send(&m);
+  queue_setpoint(&m);
 }
 
 // RC override helpers
@@ -1909,15 +2039,11 @@ static bool airwall_repulsion(uint64_t t, float *vx_ned, float *vy_ned) {
     static uint64_t last_airwall_log = 0;
     if (t - last_airwall_log >= AIRWALL_LOG_MS) {
       last_airwall_log = t;
+      // (printf is log_msg, which already writes to txt_log_fp; the old extra fprintf duplicated every line)
       printf("AIRWALL: vx=%.2f vy=%.2f  F=%.2f R=%.2f B=%.2f L=%.2f\n",
              *vx_ned, *vy_ned,
              tof_filt_m[D_FRONT], tof_filt_m[D_RIGHT],
              tof_filt_m[D_BACK], tof_filt_m[D_LEFT]);
-      if (txt_log_fp)
-        fprintf(txt_log_fp, "[%.3f] AIRWALL: vx=%.2f vy=%.2f  F=%.2f R=%.2f B=%.2f L=%.2f\n",
-                t * 0.001f, *vx_ned, *vy_ned,
-                tof_filt_m[D_FRONT], tof_filt_m[D_RIGHT],
-                tof_filt_m[D_BACK], tof_filt_m[D_LEFT]);
     }
   }
   return active;
@@ -2054,13 +2180,21 @@ skip_xy_lock: (void)0;
   float yaw = have_yaw_target ? yaw_target_deg : current_heading_deg();
   float z_down = hover_target_z_down();
 
-  // Air-wall: override to velocity mode when near a wall
+  // Air-wall. Old behaviour: switch to a "velocity" command that ArduPilot rejected, which reset
+  // the controller to the drone's current (wall-ward) velocity -- both recorded crashes.
+  // New behaviour: when locked, slide the hold anchor away from the wall at the repulsion
+  // speed and keep a pure position hold; when not locked, command the repulsion velocity with a
+  // valid position+velocity setpoint.
   float aw_vx = 0.0f, aw_vy = 0.0f;
   bool airwall_active = airwall_repulsion(t, &aw_vx, &aw_vy);
 
-  if (airwall_active) {
-    // Near a wall — always use velocity mode with repulsion, regardless
-    // of XY lock state, so drift toward a wall is actively resisted.
+  if (airwall_active && hover_xy_locked &&
+      isfinite(hover_lock_x_m) && isfinite(hover_lock_y_m)) {
+    const float dt = CONTROL_PERIOD_MS * 0.001f;
+    hover_lock_x_m += aw_vx * dt;
+    hover_lock_y_m += aw_vy * dt;
+    send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, z_down, yaw);
+  } else if (airwall_active && lpos_ok) {
     send_prelock_hold(aw_vx, aw_vy);
   } else if (hover_xy_locked) {
     send_pos_yaw_ned(hover_lock_x_m, hover_lock_y_m, z_down, yaw);
@@ -2099,24 +2233,28 @@ static bool hover_prelock_guard_tick(uint64_t t) {
   return false;
 }
 
+// Downlink budget. The old set requested OPTICAL_FLOW + OPTICAL_FLOW_RAD and DISTANCE_SENSOR +
+// RANGEFINDER (duplicates) and SERVO_OUTPUT_RAW at 20 Hz: ~4.4 KB/s of a 5.76 KB/s link.
+// EKF_STATUS_REPORT never arrived in any flight, which silently disabled every EKF gate.
+static uint64_t last_stream_request_ms = 0;
 static void request_streams(void) {
   const uint8_t tgt_sys  = fc_sysid;
   const uint8_t tgt_comp = 0;
+  last_stream_request_ms = now_ms();
 
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_SYS_STATUS,          200000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_SERVO_OUTPUT_RAW,     50000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_RC_CHANNELS,          200000.0f, 0,0,0,0,0);
-
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_BATTERY_STATUS,      200000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_DISTANCE_SENSOR,     100000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_EXTENDED_SYS_STATE,  200000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_ATTITUDE,             50000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_LOCAL_POSITION_NED,   50000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_OPTICAL_FLOW,         50000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_OPTICAL_FLOW_RAD,     50000.0f, 0,0,0,0,0);
-
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, (float)MAVLINK_MSG_ID_RANGEFINDER,  100000.0f, 0,0,0,0,0);
-  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, (float)MAVLINK_MSG_ID_EKF_STATUS_REPORT, 200000.0f, 0,0,0,0,0);
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_ATTITUDE,             50000.0f, 0,0,0,0,0); // 20 Hz
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_LOCAL_POSITION_NED,   50000.0f, 0,0,0,0,0); // 20 Hz
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_OPTICAL_FLOW,        100000.0f, 0,0,0,0,0); // 10 Hz
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_DISTANCE_SENSOR,     100000.0f, 0,0,0,0,0); // 10 Hz
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_SERVO_OUTPUT_RAW,    100000.0f, 0,0,0,0,0); // 10 Hz (takeoff motor-start detect)
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_SYS_STATUS,          200000.0f, 0,0,0,0,0); //  5 Hz
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_EXTENDED_SYS_STATE,  200000.0f, 0,0,0,0,0); //  5 Hz
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, (float)MAVLINK_MSG_ID_EKF_STATUS_REPORT, 200000.0f, 0,0,0,0,0); // 5 Hz
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_BATTERY_STATUS,      500000.0f, 0,0,0,0,0); //  2 Hz
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_RC_CHANNELS,        1000000.0f, 0,0,0,0,0); //  1 Hz (logging only)
+  // Stop the duplicates (interval -1 = disable). Handlers stay in case the FC sends them anyway.
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, MAVLINK_MSG_ID_OPTICAL_FLOW_RAD,         -1.0f, 0,0,0,0,0);
+  send_command_long_tgt(tgt_sys, tgt_comp, MAV_CMD_SET_MESSAGE_INTERVAL, (float)MAVLINK_MSG_ID_RANGEFINDER,       -1.0f, 0,0,0,0,0);
 }
 
 // ----------------------------- MAVLink decode handlers -----------------
@@ -2707,11 +2845,14 @@ static void pump_human_bridge(void) {
   human_bridge_maybe_expire(now_ms());
 }
 
+// Second-smallest valid return in one column, middle rows only (outer rows see the floor:
+// scan logs show the edge rows tracking altitude, corr +0.87). Zones the ESP32 marks invalid
+// (0xFFFF, after the target_status fix in tof_esp32.ino) or 0 are skipped.
 static float robust_col_dist_m(const uint8_t* sensor_grid_u16le, int col) {
   float best = NAN;
   float second = NAN;
 
-  for (int row = 0; row < TOF_ROWS; row++) {
+  for (int row = TOF_ROW_FIRST; row <= TOF_ROW_LAST; row++) {
     int i = row * TOF_COLS + col;
     uint16_t mm = rd_u16_le(sensor_grid_u16le + i * 2);
     if (mm == 0xFFFF || mm == 0) continue;
@@ -2754,6 +2895,7 @@ static void accept_scan_frame(const uint8_t* frame) {
   last_scan_host_ms = now_ms();
   have_scan_frame = true;
   scan_new = true;
+  tof_filter_pending = true;
 
   compute_beams_and_minima(frame);
 }
@@ -2769,11 +2911,16 @@ static void accept_ctrl_frame(const uint8_t* frame) {
   static uint32_t last_land_seq = 0;
   static uint8_t land_streak = 0;
   static uint64_t land_first_ms = 0;
+  static uint32_t last_arm_seq = 0;
+  static uint8_t arm_streak = 0;
+  static uint64_t arm_first_ms = 0;
   static uint64_t last_ctrl_log_ms = 0;
 
   if (cmd == CTRL_CMD_DISARM) {
     land_streak = 0;
     land_first_ms = 0;
+    arm_streak = 0;
+    arm_first_ms = 0;
     bool seq_ok = (seq == last_disarm_seq) || (seq == (last_disarm_seq + 1));
     bool new_window = (disarm_first_ms == 0) ||
                       (t - disarm_first_ms) > CTRL_DISARM_CONFIRM_MS ||
@@ -2808,13 +2955,34 @@ static void accept_ctrl_frame(const uint8_t* frame) {
     want_land = false;
     printf("CTRL: DISARM confirmed (seq=%u)\n", (unsigned)seq);
   } else if (cmd == CTRL_CMD_ARM) {
+    // ARM used to be accepted on a single frame. A desynced ToF stream can produce a CTRL header
+    // + valid XOR by chance (6 checksum failures in the logs show the parser does see noise), so
+    // ARM now needs the same confirmation as DISARM/LAND. The M5Stack sends ARM twice.
+    // A pending ARM does not clear a pending DISARM (disarm always wins).
+    bool seq_ok = (seq == last_arm_seq) || (seq == (last_arm_seq + 1));
+    bool new_window = (arm_first_ms == 0) ||
+                      (t - arm_first_ms) > CTRL_ARM_CONFIRM_MS ||
+                      (!seq_ok && arm_streak > 0);
+    if (new_window) {
+      arm_first_ms = t;
+      arm_streak = 1;
+      last_arm_seq = seq;
+      printf("CTRL: ARM pending (seq=%u)\n", (unsigned)seq);
+      return;
+    }
+    arm_streak++;
+    last_arm_seq = seq;
+    if (arm_streak < CTRL_ARM_MIN_STREAK) return;
+
+    arm_streak = 0;
+    arm_first_ms = 0;
     disarm_streak = 0;
     disarm_first_ms = 0;
     land_streak = 0;
     land_first_ms = 0;
     want_arm = true;
     want_land = false;
-    printf("CTRL: ARM (seq=%u)\n", (unsigned)seq);
+    printf("CTRL: ARM confirmed (seq=%u)\n", (unsigned)seq);
   } else if (cmd == CTRL_CMD_LAND) {
     disarm_streak = 0;
     disarm_first_ms = 0;
@@ -2856,8 +3024,9 @@ static void accept_ctrl_frame(const uint8_t* frame) {
 }
 
 static void pump_tof_uart(void) {
-  uint8_t buf[512];
-  int n = (int)read(tof_fd, buf, sizeof(buf));
+  uint8_t buf[1024];
+  for (;;) {
+  int n = (int)read(tof_fd, buf, sizeof(buf));   // drain everything available (was one 512 B read per wakeup)
   if (n <= 0) return;
 
   for (int i = 0; i < n; i++) {
@@ -2875,10 +3044,12 @@ static void pump_tof_uart(void) {
         if (c == ctrl_rxbuf[CTRL_BYTES-1]) {
           accept_ctrl_frame(ctrl_rxbuf);
         } else {
-          printf("CTRL_DBG: checksum FAIL (got=0x%02X want=0x%02X) bytes=[%02X %02X %02X %02X %02X %02X %02X]\n",
-                 c, ctrl_rxbuf[CTRL_BYTES-1],
-                 ctrl_rxbuf[0], ctrl_rxbuf[1], ctrl_rxbuf[2], ctrl_rxbuf[3],
-                 ctrl_rxbuf[4], ctrl_rxbuf[5], ctrl_rxbuf[6]);
+          static uint64_t last_fail_log_ms = 0;
+          uint64_t tn = now_ms();
+          if (tn - last_fail_log_ms > 1000) {
+            last_fail_log_ms = tn;
+            printf("CTRL_DBG: checksum FAIL (got=0x%02X want=0x%02X)\n", c, ctrl_rxbuf[CTRL_BYTES-1]);
+          }
         }
         ctrl_rxpos = 0;
       }
@@ -2892,25 +3063,40 @@ static void pump_tof_uart(void) {
         uint8_t c = xor8(tof_rxbuf, SCAN_BYTES-1);
         if (c == tof_rxbuf[SCAN_BYTES-1]) {
           accept_scan_frame(tof_rxbuf);
+          tof_rxpos = 0;
+        } else {
+          // Resync: the 0xA5 we locked onto was probably a data byte. Restart from the next
+          // 0xA5 inside the bytes we already have instead of throwing away a whole frame.
+          int k = 1;
+          while (k < SCAN_BYTES && tof_rxbuf[k] != SCAN_HEADER) k++;
+          if (k < SCAN_BYTES) {
+            memmove(tof_rxbuf, tof_rxbuf + k, (size_t)(SCAN_BYTES - k));
+            tof_rxpos = SCAN_BYTES - k;
+          } else {
+            tof_rxpos = 0;
+          }
         }
-        tof_rxpos = 0;
       }
       continue;
     }
 
     // --- Neither parser active: check for frame headers ---
     if (b == CTRL_HEADER) {
-      printf("CTRL_DBG: got header 0xA6 (tof_rxpos=%d ctrl_rxpos=%d)\n", tof_rxpos, ctrl_rxpos);
       ctrl_rxbuf[ctrl_rxpos++] = b;
     } else if (b == SCAN_HEADER) {
       tof_rxbuf[tof_rxpos++] = b;
     }
   }
+  }
 }
 
 // ----------------------------- Filtering --------------------------------
+// EMA over ToF frames. Runs once per NEW frame; previously it ran every control tick, so the
+// same frame was averaged in many times and the filter constant depended on the loop rate.
 static void tof_filter_tick(void) {
-  const float alpha = 0.20f;
+  if (!tof_filter_pending) return;
+  tof_filter_pending = false;
+  const float alpha = 0.35f;   // per ~5-10 Hz frame
   for (int d = 0; d < 4; d++) {
     float v = tof_min_m[d];
     if (isnan(v)) continue;
@@ -3407,11 +3593,8 @@ static void log_tick(uint64_t t) {
 
 // ----------------------------- Frontier exploration --------------------
 static void frontier_reset_map(float center_x_m, float center_y_m) {
-  for (int y = 0; y < FRONTIER_GRID_H; y++) {
-    for (int x = 0; x < FRONTIER_GRID_W; x++) {
-      frontier_grid[y][x] = OCC_UNKNOWN;
-    }
-  }
+  memset(frontier_grid, (unsigned char)FRONTIER_LO_UNKNOWN, sizeof(frontier_grid));
+  frontier_bb_valid = false;
 
   frontier_grid_origin_x_m = center_x_m - 0.5f * (float)FRONTIER_GRID_W * FRONTIER_GRID_CELL_M;
   frontier_grid_origin_y_m = center_y_m - 0.5f * (float)FRONTIER_GRID_H * FRONTIER_GRID_CELL_M;
@@ -3453,15 +3636,36 @@ static void frontier_cell_to_world(int ix, int iy, float* out_x_m, float* out_y_
   if (out_y_m) *out_y_m = frontier_grid_origin_y_m + ((float)iy + 0.5f) * FRONTIER_GRID_CELL_M;
 }
 
+// Classify a log-odds cell. Out-of-grid counts as occupied (never plan off the map).
 static OccupancyCell frontier_cell_value(int ix, int iy) {
   if (ix < 0 || iy < 0 || ix >= FRONTIER_GRID_W || iy >= FRONTIER_GRID_H) return OCC_OCCUPIED;
-  return (OccupancyCell)frontier_grid[iy][ix];
+  int8_t v = frontier_grid[iy][ix];
+  if (v == FRONTIER_LO_UNKNOWN) return OCC_UNKNOWN;
+  return (v >= FRONTIER_LO_OCC_THRESH) ? OCC_OCCUPIED : OCC_FREE;
 }
 
-static void frontier_set_cell_world(float x_m, float y_m, OccupancyCell v) {
-  int ix = 0, iy = 0;
-  if (!frontier_world_to_cell(x_m, y_m, &ix, &iy)) return;
+// Add evidence to a cell (log-odds, clamped). Replaces the old "last write wins" setter, where a
+// single noisy return left a permanent obstacle (54 blocked paths in 3_hallWay) and a single
+// grazing free ray erased a wall.
+static void frontier_update_cell(int ix, int iy, int delta) {
+  if (ix < 0 || iy < 0 || ix >= FRONTIER_GRID_W || iy >= FRONTIER_GRID_H) return;
+  int v = frontier_grid[iy][ix];
+  if (v == FRONTIER_LO_UNKNOWN) v = 0;
+  v += delta;
+  if (v < FRONTIER_LO_MIN) v = FRONTIER_LO_MIN;
+  if (v > FRONTIER_LO_MAX) v = FRONTIER_LO_MAX;
   frontier_grid[iy][ix] = (int8_t)v;
+
+  if (!frontier_bb_valid) {
+    frontier_bb_x0 = frontier_bb_x1 = ix;
+    frontier_bb_y0 = frontier_bb_y1 = iy;
+    frontier_bb_valid = true;
+  } else {
+    if (ix < frontier_bb_x0) frontier_bb_x0 = ix;
+    if (ix > frontier_bb_x1) frontier_bb_x1 = ix;
+    if (iy < frontier_bb_y0) frontier_bb_y0 = iy;
+    if (iy > frontier_bb_y1) frontier_bb_y1 = iy;
+  }
 }
 
 static float frontier_dir_base_deg(int dir) {
@@ -3480,18 +3684,28 @@ static void frontier_mark_ray(float x0_m, float y0_m, float yaw_deg, float dist_
 
   float free_limit_m = dist_m - FRONTIER_OCC_END_MARGIN_M;
   if (free_limit_m < 0.0f) free_limit_m = 0.0f;
+  const float c = cosf(deg2rad(yaw_deg));
+  const float sn = sinf(deg2rad(yaw_deg));
 
+  bool has_hit = dist_m <= FRONTIER_OCCUPIED_MAX_RANGE_M;
+  int hit_ix = -1, hit_iy = -1;
+  if (has_hit && !frontier_world_to_cell(x0_m + c * dist_m, y0_m + sn * dist_m, &hit_ix, &hit_iy)) {
+    has_hit = false;
+  }
+
+  // Free evidence along the ray: each cell at most once per ray (the 0.075 m step visits most
+  // 0.15 m cells twice), and never the hit cell itself.
+  int last_ix = -1, last_iy = -1;
   for (float s = 0.0f; s <= free_limit_m; s += FRONTIER_RAY_STEP_M) {
-    float x_m = x0_m + cosf(deg2rad(yaw_deg)) * s;
-    float y_m = y0_m + sinf(deg2rad(yaw_deg)) * s;
-    frontier_set_cell_world(x_m, y_m, OCC_FREE);
+    int ix = 0, iy = 0;
+    if (!frontier_world_to_cell(x0_m + c * s, y0_m + sn * s, &ix, &iy)) break;
+    if (ix == last_ix && iy == last_iy) continue;
+    last_ix = ix; last_iy = iy;
+    if (has_hit && ix == hit_ix && iy == hit_iy) continue;
+    frontier_update_cell(ix, iy, FRONTIER_LO_FREE_STEP);
   }
 
-  if (dist_m <= FRONTIER_OCCUPIED_MAX_RANGE_M) {
-    float end_x_m = x0_m + cosf(deg2rad(yaw_deg)) * dist_m;
-    float end_y_m = y0_m + sinf(deg2rad(yaw_deg)) * dist_m;
-    frontier_set_cell_world(end_x_m, end_y_m, OCC_OCCUPIED);
-  }
+  if (has_hit) frontier_update_cell(hit_ix, hit_iy, FRONTIER_LO_OCC_STEP);
 }
 
 static void frontier_update_map_from_latest_scan(void) {
@@ -3543,6 +3757,13 @@ static void frontier_update_map_from_latest_scan(void) {
     return;
   }
   if (!isfinite(pose.x_m) || !isfinite(pose.y_m) || !isfinite(pose.yaw_deg)) return;
+  // Rays are projected as horizontal; when tilted the middle rows also reach the floor/ceiling.
+  if (isfinite(pose.roll_rad) && isfinite(pose.pitch_rad) &&
+      (fabsf(rad2deg(pose.roll_rad)) > FRONTIER_MAP_MAX_TILT_DEG ||
+       fabsf(rad2deg(pose.pitch_rad)) > FRONTIER_MAP_MAX_TILT_DEG)) {
+    frontier_last_map_scan_ms = last_scan_host_ms;  // consume this frame
+    return;
+  }
 
   const uint8_t* p = last_scan_grid_raw;
   for (int dir = 0; dir < NUM_SENSORS; dir++) {
@@ -3555,6 +3776,12 @@ static void frontier_update_map_from_latest_scan(void) {
 
       float u = ((float)col + 0.5f) / (float)TOF_COLS;
       float col_offset_deg = (u - 0.5f) * FRONTIER_SENSOR_FOV_DEG;
+      // The VL53L5CX reports PERPENDICULAR depth (along the sensor axis), not the range along
+      // each zone's ray: on 1284 flat-wall views in the logs, depth/cos(az) gives straight walls
+      // (4.4 mm line-fit RMS) and treating it as radial bends them (21.4 mm); head-on edge/centre
+      // ratio 0.996 (radial would be 1.062). See analysis/scripts/verify_range_model.py.
+      // Horizontal range along the column ray = depth / cos(column azimuth) for any row.
+      dist_m /= cosf(deg2rad(col_offset_deg));
       frontier_mark_ray(pose.x_m, pose.y_m, base_deg + col_offset_deg, dist_m);
     }
   }
@@ -3784,10 +4011,21 @@ static bool frontier_select_target(float cur_x_m, float cur_y_m,
   uint32_t raw_reject_clearance_count = 0;
   uint32_t raw_reject_path_count = 0;
   uint32_t raw_reject_cone_count = 0;
+  uint32_t raw_reject_near_count = 0;
   FrontierStepDiag step_diag_total = {0};
 
-  for (int iy = 1; iy < FRONTIER_GRID_H - 1; iy++) {
-    for (int ix = 1; ix < FRONTIER_GRID_W - 1; ix++) {
+  if (!frontier_bb_valid) {
+    append_reason(reject_reason, reject_reason_sz, "map_empty");
+    return false;
+  }
+  // Only scan the observed bounding box (+1 cell), not all 1M cells.
+  const int scan_y0 = (frontier_bb_y0 - 1 < 1) ? 1 : frontier_bb_y0 - 1;
+  const int scan_y1 = (frontier_bb_y1 + 1 > FRONTIER_GRID_H - 2) ? FRONTIER_GRID_H - 2 : frontier_bb_y1 + 1;
+  const int scan_x0 = (frontier_bb_x0 - 1 < 1) ? 1 : frontier_bb_x0 - 1;
+  const int scan_x1 = (frontier_bb_x1 + 1 > FRONTIER_GRID_W - 2) ? FRONTIER_GRID_W - 2 : frontier_bb_x1 + 1;
+
+  for (int iy = scan_y0; iy <= scan_y1; iy++) {
+    for (int ix = scan_x0; ix <= scan_x1; ix++) {
       if (visited[iy][ix] || !frontier_is_frontier_cell(ix, iy)) continue;
 
       cluster_count++;
@@ -3857,6 +4095,11 @@ static bool frontier_select_target(float cur_x_m, float cur_y_m,
         }
 
         float dist_m = hypotf(wx_m - cur_x_m, wy_m - cur_y_m);
+        // Frontier cells within pose noise of the drone are not worth a move.
+        if (dist_m < FRONTIER_MIN_TARGET_DIST_M) {
+          raw_reject_near_count++;
+          continue;
+        }
 
         // Forward-cone filter: reject targets behind the drone's nose
         if (have_att && dist_m > 0.01f) {
@@ -3913,7 +4156,10 @@ static bool frontier_select_target(float cur_x_m, float cur_y_m,
 
       float step_clearance_m = frontier_cell_clearance_m(step_ix, step_iy);
       float step_dist_m = hypotf(step_x_m - cur_x_m, step_y_m - cur_y_m);
-      float step_score = step_dist_m - 0.25f * fminf(step_clearance_m, 1.0f);
+      // Rank clusters by the raw-candidate score (distance, centroid, clearance, heading) with a
+      // bonus for bigger clusters (more unknown area behind them). The old score used the
+      // capped step length, which is identical for every far frontier.
+      float step_score = best_raw_score - 0.03f * fminf((float)cluster_n, 30.0f);
 
       if (!found || step_score < best.score) {
         found = true;
@@ -3931,7 +4177,7 @@ static bool frontier_select_target(float cur_x_m, float cur_y_m,
 
   if (!found) {
     append_reason(reject_reason, reject_reason_sz, "no_valid_frontier");
-    printf("FRONTIER: no valid frontier clusters=%u frontier_cells=%u small=%u no_raw=%u step_fail=%u step_final_cell=%u raw_ok=%u raw_reject(clr=%u path=%u cone=%u) step_reject(near=%u oob=%u occ=%u clr=%u path=%u)\n",
+    printf("FRONTIER: no valid frontier clusters=%u frontier_cells=%u small=%u no_raw=%u step_fail=%u step_final_cell=%u raw_ok=%u raw_reject(clr=%u path=%u cone=%u near=%u) step_reject(near=%u oob=%u occ=%u clr=%u path=%u)\n",
            (unsigned)cluster_count, (unsigned)frontier_cell_count,
            (unsigned)small_cluster_count, (unsigned)no_raw_candidate_count,
            (unsigned)step_build_fail_count, (unsigned)step_final_cell_fail_count,
@@ -3939,6 +4185,7 @@ static bool frontier_select_target(float cur_x_m, float cur_y_m,
            (unsigned)raw_reject_clearance_count,
            (unsigned)raw_reject_path_count,
            (unsigned)raw_reject_cone_count,
+           (unsigned)raw_reject_near_count,
            (unsigned)step_diag_total.too_close,
            (unsigned)step_diag_total.world_to_cell,
            (unsigned)step_diag_total.occupied,
@@ -4026,7 +4273,41 @@ static void frontier_tick(uint64_t t) {
       if (hover_prelock_guard_tick(t)) break;
 
       if (!hover_xy_locked) break;
-      if ((t - frontier_state_enter_ms) < FRONTIER_SCAN_HOVER_MS) break;
+
+      // Yaw sweep: dwell -> rotate 45 deg in <=12 deg steps (below the yaw-drift guardian's
+      // 20 deg threshold) -> dwell. Direction alternates each cycle so the heading oscillates
+      // instead of winding up. This fills the four diagonal blind wedges between the sensors.
+      if (frontier_scan_yaw_phase == 0) {
+        if ((t - frontier_state_enter_ms) < FRONTIER_SCAN_HOVER_MS) break;
+        frontier_scan_yaw_goal_deg = wrap_deg(yaw_target_deg +
+                                              (float)frontier_scan_yaw_dir * FRONTIER_SCAN_YAW_SPAN_DEG);
+        frontier_scan_yaw_phase = 1;
+        frontier_scan_yaw_phase_ms = 0;          // allow the first step immediately
+        frontier_scan_yaw_start_ms = t;
+        printf("FRONTIER: yaw sweep %.1f -> %.1f\n", yaw_target_deg, frontier_scan_yaw_goal_deg);
+      }
+      if (frontier_scan_yaw_phase == 1) {
+        float remaining = wrap_deg(frontier_scan_yaw_goal_deg - yaw_target_deg);
+        float heading_err = fabsf(wrap_deg(current_heading_deg() - yaw_target_deg));
+        bool timed_out = (t - frontier_scan_yaw_start_ms) >= FRONTIER_SCAN_YAW_TIMEOUT_MS;
+        if ((fabsf(remaining) < 0.5f && heading_err < FRONTIER_SCAN_YAW_SETTLE_DEG) || timed_out) {
+          if (timed_out) printf("FRONTIER: yaw sweep timeout (heading_err=%.1f)\n", heading_err);
+          frontier_scan_yaw_phase = 2;
+          frontier_scan_yaw_phase_ms = t;
+          frontier_scan_yaw_dir = -frontier_scan_yaw_dir;
+        } else if (fabsf(remaining) >= 0.5f && heading_err < FRONTIER_SCAN_YAW_SETTLE_DEG &&
+                   (frontier_scan_yaw_phase_ms == 0 ||
+                    (t - frontier_scan_yaw_phase_ms) >= FRONTIER_SCAN_YAW_DWELL_MS)) {
+          float step = remaining;
+          if (step >  FRONTIER_SCAN_YAW_STEP_DEG) step =  FRONTIER_SCAN_YAW_STEP_DEG;
+          if (step < -FRONTIER_SCAN_YAW_STEP_DEG) step = -FRONTIER_SCAN_YAW_STEP_DEG;
+          yaw_target_deg = wrap_deg(yaw_target_deg + step);
+          hover_hold_yaw_deg = yaw_target_deg;
+          frontier_scan_yaw_phase_ms = t;
+        }
+        break;
+      }
+      if ((t - frontier_scan_yaw_phase_ms) < FRONTIER_SCAN_HOVER_MS) break;   // dwell at new heading
       if (!scan_fresh(t) || frontier_last_map_scan_ms == 0) break;
 
       char reasons[160];
@@ -4080,42 +4361,50 @@ static void frontier_tick(uint64_t t) {
         break;
       }
 
+      // Wall protection during the move (there was none before): slide the target away from
+      // a close wall at the airwall speed, keeping a pure position setpoint.
+      {
+        float aw_vx = 0.0f, aw_vy = 0.0f;
+        if (airwall_repulsion(t, &aw_vx, &aw_vy)) {
+          const float dt = CONTROL_PERIOD_MS * 0.001f;
+          frontier_target_x_m += aw_vx * dt;
+          frontier_target_y_m += aw_vy * dt;
+        }
+      }
       send_pos_yaw_ned(frontier_target_x_m, frontier_target_y_m, move_z_down, yaw_deg);
       frontier_log_move_progress(t);
 
-      // Progress gate: abort early if error is not shrinking.
-      // Use a rolling baseline: track best (lowest) error seen, and abort
-      // if the current error exceeds the best by a margin (diverging).
+      // Progress gate. frontier_progress_err_m = best error so far, frontier_progress_check_ms =
+      // time of the last meaningful improvement. Abort if stalled for STALL_MS or diverging by
+      // DIVERGE_M. (The old gate aborted on 2 cm of noise.)
       if (lpos_fresh(t) && isfinite(lpos_x_m) && isfinite(lpos_y_m)) {
         float cur_err_m = hypotf(lpos_x_m - frontier_target_x_m,
                                  lpos_y_m - frontier_target_y_m);
         if (frontier_progress_check_ms == 0) {
-          // First sample — seed baseline, start the clock
           frontier_progress_err_m = cur_err_m;
           frontier_progress_check_ms = t;
         } else {
-          // Track best error seen so far
-          if (cur_err_m < frontier_progress_err_m)
+          if (cur_err_m < frontier_progress_err_m - FRONTIER_PROGRESS_MIN_GAIN_M) {
             frontier_progress_err_m = cur_err_m;
-
-          // Check at interval: if current error is worse than best + margin, abort
-          if ((t - frontier_progress_check_ms) >= FRONTIER_PROGRESS_CHECK_MS) {
-            if (cur_err_m > (frontier_progress_err_m + FRONTIER_PROGRESS_MIN_GAIN_M)) {
-              printf("FRONTIER: no progress err=%.2f best=%.2f (%.1fs) -> abort\n",
-                     cur_err_m, frontier_progress_err_m,
-                     (float)(t - frontier_progress_check_ms) * 0.001f);
-              frontier_move_fail_count++;
-              frontier_reset_move_target();
-              if (frontier_move_fail_count >= FRONTIER_MAX_MOVE_FAILURES) {
-                enter_state(ST_LANDING, "No Progress");
-              } else {
-                frontier_restart_relock_window(t, NAN, NAN);
-                enter_state(ST_HOVER_SCAN, "No Progress Retry");
-              }
-              break;
-            }
-            // Reset timer for next interval check
             frontier_progress_check_ms = t;
+          }
+          bool diverging = cur_err_m > frontier_progress_err_m + FRONTIER_PROGRESS_DIVERGE_M;
+          bool stalled = (t - frontier_progress_check_ms) >= FRONTIER_PROGRESS_STALL_MS &&
+                         cur_err_m > FRONTIER_ARRIVAL_TOL_M;
+          if (diverging || stalled) {
+            printf("FRONTIER: no progress (%s) err=%.2f best=%.2f (%.1fs since improvement) -> abort\n",
+                   diverging ? "diverging" : "stalled",
+                   cur_err_m, frontier_progress_err_m,
+                   (float)(t - frontier_progress_check_ms) * 0.001f);
+            frontier_move_fail_count++;
+            frontier_reset_move_target();
+            if (frontier_move_fail_count >= FRONTIER_MAX_MOVE_FAILURES) {
+              enter_state(ST_LANDING, "No Progress");
+            } else {
+              frontier_restart_relock_window(t, NAN, NAN);
+              enter_state(ST_HOVER_SCAN, "No Progress Retry");
+            }
+            break;
           }
         }
       }
@@ -4270,6 +4559,9 @@ static void enter_state(State ns, const char* reason) {
              map_cx_m, map_cy_m);
     }
   }
+  if (ns == ST_HOVER_SCAN) {
+    frontier_scan_yaw_phase = 0;   // each scan cycle: dwell, 45 deg sweep, dwell
+  }
   if (ns == ST_LANDING) {
     land_mode_sent = false;
     land_mode_sent_ms = 0;
@@ -4323,7 +4615,9 @@ static void liftoff_assist_tick(uint64_t t) {
     // Ease-out ramp for quicker breakaway without a hard jump.
     float ue = sqrtf(u);
     float thr = (1.0f - ue) * (float)ASSIST_THR_US_MIN + ue * (float)ASSIST_THR_US_MAX;
-    // Map PWM-ish range to normalized thrust 0..1 (rough). Assume 1000-2000µs.
+    // Map to SET_ATTITUDE_TARGET "thrust", which ArduCopter reads as a climb-rate fraction
+    // (0.5 = hold, 1.0 = max climb) with GUID_OPTIONS bit 3 clear. 1550..1850 -> 0.55..0.85
+    // (clamped to 0.80 in send_attitude_target_thrust), i.e. a gentle-to-firm climb request.
     float thr_norm = (thr - 1000.0f) / 1000.0f;
     if (thr_norm < 0.0f) thr_norm = 0.0f;
     if (thr_norm > 1.0f) thr_norm = 1.0f;
@@ -4375,7 +4669,7 @@ static void takeoff_att_ramp_tick(uint64_t t) {
   float u = (dt >= 700) ? 1.0f : (float)dt / 700.0f;
   if (u < 0.0f) u = 0.0f;
 
-  // Allow a bit more ceiling for heavier craft and ramp faster.
+  // Climb-rate ramp (not throttle -- see send_attitude_target_thrust): 0.5 = hold -> 0.8 cap.
   float thr = (1.0f - u) * 0.50f + u * 0.95f;
   float yaw = have_yaw_target ? yaw_target_deg : (have_att ? current_heading_deg() : 0.0f);
   send_attitude_target_thrust(thr, yaw);
@@ -4831,6 +5125,32 @@ static void control_tick(void) {
     request_rcmap_params();
   }
 
+  // Re-request streams if any essential one is missing (the original requested them once at
+  // link-up; on a congested link some SET_MESSAGE_INTERVALs were lost and never retried).
+  if ((t - last_stream_request_ms) > 5000 &&
+      (!att_fresh(t) || !lpos_fresh(t) || !of_fresh(t) || !ekf_fresh(t) || !sys_fresh(t))) {
+    printf("STREAMS: re-requesting (att=%d lpos=%d of=%d ekf=%d sys=%d)\n",
+           att_fresh(t), lpos_fresh(t), of_fresh(t), ekf_fresh(t), sys_fresh(t));
+    request_streams();
+  }
+
+  // Link health (once per 5 s): dropped setpoints mean the link is still too slow.
+  {
+    static uint64_t last_link_log_ms = 0;
+    static uint32_t last_dropped = 0, last_failed = 0;
+    if ((t - last_link_log_ms) >= 5000) {
+      last_link_log_ms = t;
+      if (fc_tx_dropped_setpoints != last_dropped || fc_tx_failed_writes != last_failed) {
+        printf("LINK: setpoints dropped=%u (+%u) write_fail=%u (+%u) txq=%dB baud=%d\n",
+               (unsigned)fc_tx_dropped_setpoints, (unsigned)(fc_tx_dropped_setpoints - last_dropped),
+               (unsigned)fc_tx_failed_writes, (unsigned)(fc_tx_failed_writes - last_failed),
+               fc_txq_bytes(), fc_baud);
+        last_dropped = fc_tx_dropped_setpoints;
+        last_failed = fc_tx_failed_writes;
+      }
+    }
+  }
+
   if (hard_nogo(t)) {
     printf("NO-GO: SYS_STATUS indicates gyro or motor outputs unhealthy.\n");
     if (fc_armed) enter_state(ST_DISARMING, "Health Fail");
@@ -4896,8 +5216,12 @@ static void control_tick(void) {
 
   // want_arm dropped while armed -> FORCE DISARM immediately (any state/mode)
   if (!want_arm && fc_armed) {
-    last_disarm_cmd_ms = 0;
+    // Send immediately on the first tick of the abort, then at disarm_fc_force()'s retry rate.
+    // (Previously the rate limiter was reset every tick, so a DISARM was sent on every loop
+    // iteration until the next 1 Hz heartbeat showed disarmed.)
+    if (st != ST_DISARMING) last_disarm_cmd_ms = 0;
     disarm_fc_force();
+    discard_pending_setpoint();
     enter_state(ST_DISARMING, "User Abort");
     goto control_tick_done;
   }
@@ -5271,33 +5595,16 @@ static void control_tick(void) {
       // drifted freely and the velocity gate could never pass.
       if (takeoff_brake_active) {
         if (!ceiling_active) {
-          float z_down = -TAKEOFF_TARGET_M;
-          float yaw = have_yaw_target ? yaw_target_deg : current_heading_deg();
-
           // Airwall repulsion: if near a wall, blend repulsion into the
           // velocity command so the drone is actively pushed away.
           float brake_vx = 0.0f, brake_vy = 0.0f;
           airwall_repulsion(t, &brake_vx, &brake_vy);
+          // send_prelock_hold() uses the TAKEOFF-phase altitude target and the latched yaw.
 
-          uint16_t mask =
-              (1<<0)|(1<<1)          // ignore x,y position (use vx,vy)
-            | (1<<5)                 // ignore vz (use z position)
-            | (1<<6)|(1<<7)|(1<<8)   // ignore accel
-            | (1<<11);               // ignore yaw_rate
-
-          mavlink_message_t m;
-          mavlink_msg_set_position_target_local_ned_pack(
-              g_sysid, g_compid, &m,
-              (uint32_t)now_ms(),
-              fc_sysid, fc_compid,
-              MAV_FRAME_LOCAL_NED,
-              mask,
-              0.0f, 0.0f, z_down,
-              brake_vx, brake_vy, 0.0f,
-              0,0,0,
-              deg2rad(yaw), 0
-          );
-          mav_send(&m);
+          // The old inline mask ("ignore x,y + ignore vz") was rejected by ArduPilot and reset
+          // the controller every tick: the brake z target was thrown away (overshoot to
+          // 0.75-0.81 m) and XY kept whatever velocity it had.
+          send_prelock_hold(brake_vx, brake_vy);
         }
 
         if (takeoff_brake_settled(t)) {
@@ -5374,20 +5681,17 @@ static void control_tick(void) {
       break;
 
     case ST_LANDING: {
-      if (!land_mode_sent) {
-        set_mode_land();
-        land_mode_sent = true;
-        land_mode_sent_ms = t;
-      } else {
-        if ((t - land_mode_sent_ms) > 2000) {
-          set_mode_land();
-          land_mode_sent_ms = t;
+      // Request LAND until the heartbeat confirms it. Previously land_mode_sent was latched even
+      // when set_mode_custom() was rate-limited and had sent nothing, delaying LAND by up to 2 s.
+      if (hb_custom_mode != 9) {
+        if (!land_mode_sent || (t - land_mode_sent_ms) > 500) {
+          if (set_mode_land()) {
+            land_mode_sent = true;
+            land_mode_sent_ms = t;
+          }
         }
-      }
-
-      // WORLD vertical descent — with air-wall repulsion to avoid
-      // drifting into a wall during the descent phase.
-      {
+        // Fallback while the FC is still in GUIDED: descend with airwall push-back.
+        // (Once in LAND mode ArduPilot ignores SET_POSITION_TARGET, so stop sending them.)
         float aw_vx = 0.0f, aw_vy = 0.0f;
         airwall_repulsion(t, &aw_vx, &aw_vy);
         send_vel_frame(aw_vx, aw_vy, +0.15f, 0, MAV_FRAME_LOCAL_NED);
@@ -5428,6 +5732,9 @@ static void control_tick(void) {
   }
 
 control_tick_done:
+  // Exactly one setpoint per tick, written whole (or dropped whole if the link is backed up).
+  flush_setpoint();
+
   if (csv_fp && flight_log_active()) {
       bool off_ground = takeoff_off_ground(t);
       bool rf_now_fresh = rf_fresh(t);
@@ -5493,6 +5800,11 @@ int main(int argc, char** argv) {
       nav_mode = NAV_MODE_FRONTIER_BASIC;
       continue;
     }
+    if (strcmp(argv[i], "--fc-baud") == 0 && (i + 1) < argc) {
+      fc_baud = atoi(argv[i + 1]);   // must match SERIALn_BAUD on the FC
+      i++;
+      continue;
+    }
     if (strcmp(argv[i], "--sysid") == 0 && (i + 1) < argc) {
       int v = atoi(argv[i + 1]);
       if (v > 0 && v < 255) {
@@ -5507,9 +5819,12 @@ int main(int argc, char** argv) {
   printf("LOG: stdout + %s (human-readable), CSV=%s, SCAN=%s\n",
          LOG_TXT_PATH, LOG_CSV_PATH, LOG_SCAN_PATH);
 
-  fc_fd = open_uart(FC_UART, FC_BAUD);
+  fc_fd = open_uart(FC_UART, fc_baud);
   if (fc_fd < 0) return 1;
-  printf("Opened FC UART: %s @%d\n", FC_UART, FC_BAUD);
+  printf("Opened FC UART: %s @%d (control loop %d Hz)\n", FC_UART, fc_baud, 1000 / CONTROL_PERIOD_MS);
+  if (fc_baud < 230400) {
+    printf("WARN: FC link at %d baud is marginal for this message load; use 921600 (SERIAL5_BAUD=921 + --fc-baud 921600)\n", fc_baud);
+  }
 
   tof_fd = open_uart(TOF_UART, TOF_BAUD);
   if (tof_fd < 0) return 1;
@@ -5517,18 +5832,32 @@ int main(int argc, char** argv) {
 
   human_bridge_init();
 
+  // Fixed-rate scheduler. UARTs are drained whenever data arrives, but control_tick() (and so
+  // the setpoint stream) runs exactly every CONTROL_PERIOD_MS. The old loop called control_tick()
+  // after every poll() wakeup -- hundreds of Hz with continuous serial input -- which is what
+  // saturated the FC link.
+  uint64_t next_tick_ms = now_ms();
   while (!g_shutdown) {
     struct pollfd pfd[2];
-    pfd[0].fd = fc_fd;  pfd[0].events = POLLIN;
-    pfd[1].fd = tof_fd; pfd[1].events = POLLIN;
+    pfd[0].fd = fc_fd;  pfd[0].events = POLLIN; pfd[0].revents = 0;
+    pfd[1].fd = tof_fd; pfd[1].events = POLLIN; pfd[1].revents = 0;
 
-    poll(pfd, 2, 20);
+    uint64_t now = now_ms();
+    int timeout_ms = (next_tick_ms > now) ? (int)(next_tick_ms - now) : 0;
+    poll(pfd, 2, timeout_ms);
 
     if (pfd[0].revents & POLLIN) pump_fc_uart();
     if (pfd[1].revents & POLLIN) pump_tof_uart();
     pump_human_bridge();
 
-    control_tick();
+    now = now_ms();
+    if (now >= next_tick_ms) {
+      control_tick();
+      next_tick_ms += CONTROL_PERIOD_MS;
+      // After a long stall (SD flush, etc.) don't run a burst of catch-up ticks.
+      now = now_ms();
+      if (now > next_tick_ms + CONTROL_PERIOD_MS) next_tick_ms = now + CONTROL_PERIOD_MS;
+    }
   }
 
   human_bridge_close();
